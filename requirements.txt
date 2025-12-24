@@ -11,6 +11,7 @@ Werkzeug==1.0.1
 yt-dlp>=2024.1.1
 gunicorn
 flask-cors
+requests
 
 # System requirement (install manually if missing)
 # FFmpeg must be installed separately for audio conversion
