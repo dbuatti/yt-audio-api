@@ -9,12 +9,14 @@ RUN apt-get update && apt-get install -y ffmpeg curl unzip && \
 WORKDIR /app
 COPY . .
 
-# Install Python dependencies
-RUN pip install --no-cache-dir -r requirements.txt
+# Install Python dependencies and force update yt-dlp
+RUN pip install --no-cache-dir -r requirements.txt && \
+    pip install -U yt-dlp
 
-# Create folder for storage
+# Create folder for storage (though /tmp is used in main.py, this is good practice)
 RUN mkdir -p downloads && chmod 777 downloads
 
 EXPOSE 10000
 
-CMD ["sh", "-c", "gunicorn main:app --bind 0.0.0.0:${PORT:-10000} --workers 1 --timeout 120"]
+# Using gthread for better handling of background threading tasks
+CMD ["sh", "-c", "gunicorn main:app --bind 0.0.0.0:${PORT:-10000} --workers 1 --threads 4 --timeout 120 --worker-class gthread"]
