@@ -11,30 +11,34 @@ import yt_dlp
 app = Flask(__name__)
 CORS(app, resources={r"/*": {"origins": "*"}})
 
+# Explicit logging for Render's log viewer
 def log(message):
     print(f"[SERVER LOG] {message}")
     sys.stdout.flush()
 
+# Use /tmp for Render's ephemeral storage
 DOWNLOAD_DIR = "/tmp/downloads"
 os.makedirs(DOWNLOAD_DIR, exist_ok=True)
 
 active_tokens = {}
 
 def cleanup_old_files():
+    """Background loop to prevent /tmp from filling up."""
     while True:
         now = time.time()
         for token, data in list(active_tokens.items()):
-            if now - data['timestamp'] > 600:
+            if now - data['timestamp'] > 600:  # 10 minutes
                 file_path = data.get('file_path')
                 if file_path and os.path.exists(file_path):
                     try:
                         os.remove(file_path)
-                        log(f"Cleanup: Removed {token}")
+                        log(f"Cleanup: Removed expired file for {token}")
                     except Exception as e:
                         log(f"Cleanup error: {e}")
                 active_tokens.pop(token, None)
         time.sleep(60)
 
+# Start cleanup thread immediately
 threading.Thread(target=cleanup_old_files, daemon=True).start()
 
 def download_task(token, video_url):
@@ -57,24 +61,24 @@ def download_task(token, video_url):
             break
     
     if not use_cookies:
-        log("No cookies.txt found in Repo root or /etc/secrets/ - proceeding without cookies.")
+        log("No cookies.txt found - proceeding with Identity Triangle only.")
 
     ydl_opts = {
-        'format': 'wa*/ba*',
+        'format': 'wa*/ba*',  # Smallest audio stream to save RAM
         'outtmpl': output_template,
         'postprocessors': [{
             'key': 'FFmpegExtractAudio',
             'preferredcodec': 'mp3',
             'preferredquality': '128',
         }],
-        'impersonate': 'chrome-110',
+        # Identity Logic (Impersonate removed to fix AssertionError)
         'po_token': f"web+none:{po_token}" if po_token else None,
         'headers': {
             'X-Goog-Visitor-Id': visitor_data if visitor_data else None,
         },
         'proxy': proxy_url if proxy_url else None,
         'cookiefile': use_cookies,
-        'verbose': True, # Forces yt-dlp to print full debug logs
+        'verbose': True, # Keep verbose for debugging the handshake
         'quiet': False,
     }
 
@@ -86,11 +90,11 @@ def download_task(token, video_url):
         
         expected_file = os.path.join(DOWNLOAD_DIR, f"{file_id}.mp3")
         if os.path.exists(expected_file):
-            log(f"READY | MP3 found at: {expected_file}")
+            log(f"SUCCESS | MP3 ready for token: {token}")
             active_tokens[token]['file_path'] = expected_file
             active_tokens[token]['status'] = 'ready'
         else:
-            raise Exception("yt-dlp completed but the MP3 file is missing from disk.")
+            raise Exception("yt-dlp finished but MP3 file was not found on disk.")
 
     except Exception as e:
         full_trace = traceback.format_exc()
@@ -98,13 +102,14 @@ def download_task(token, video_url):
         log(f"TRACEBACK: {full_trace}")
         
         active_tokens[token]['status'] = 'error'
-        # Return the actual traceback or error message to the API caller
-        active_tokens[token]['error_message'] = str(e) if str(e) else "Internal Engine Crash (Check Logs)"
+        # Send actual error back to frontend for visibility
+        active_tokens[token]['error_message'] = str(e) if str(e) else "Internal Engine Crash"
 
 @app.route('/')
 def init_download():
     video_url = request.args.get('url')
-    if not video_url: return jsonify({"error": "No URL"}), 400
+    if not video_url:
+        return jsonify({"error": "No URL provided"}), 400
 
     token = str(uuid.uuid4())
     active_tokens[token] = {
@@ -112,29 +117,37 @@ def init_download():
         'timestamp': time.time(),
         'file_path': None
     }
-    
+
     log(f"New Request | URL: {video_url} | Token: {token}")
-    threading.Thread(target=download_task, args=(token, video_url)).start()
+    # Start download in background thread
+    thread = threading.Thread(target=download_task, args=(token, video_url))
+    thread.start()
+
     return jsonify({"token": token})
 
 @app.route('/download')
 def get_file():
     token = request.args.get('token')
     if not token or token not in active_tokens:
-        return jsonify({"error": "Invalid token"}), 404
+        return jsonify({"error": "Invalid or expired token"}), 404
 
     task = active_tokens[token]
-    if task['status'] == 'processing': return jsonify({"status": "processing"}), 202
+
+    if task['status'] == 'processing':
+        return jsonify({"status": "processing"}), 202
     
     if task['status'] == 'error':
         return jsonify({
             "status": "error",
             "error": task.get('error_message'),
-            "note": "Check Render logs for the full TRACEBACK."
+            "debug": "Check Render logs for full Python traceback"
         }), 500
 
     if task['status'] == 'ready':
+        log(f"Serving file for token: {token}")
         return send_file(task['file_path'], as_attachment=True, download_name="audio.mp3")
 
 if __name__ == "__main__":
-    app.run(host='0.0.0.0', port=int(os.environ.get("PORT", 10000)))
+    # Local dev entry point
+    port = int(os.environ.get("PORT", 10000))
+    app.run(host='0.0.0.0', port=port)
