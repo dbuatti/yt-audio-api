@@ -1,10 +1,8 @@
 import os
-import secrets
 import threading
 import time
 import uuid
 import sys
-import requests
 from flask import Flask, request, send_file, jsonify
 from flask_cors import CORS
 import yt_dlp
@@ -44,8 +42,7 @@ def cleanup_old_files():
 threading.Thread(target=cleanup_old_files, daemon=True).start()
 
 def download_task(token, video_url):
-    """The core engine that talks to YouTube via Proxy and PO_TOKEN."""
-    log(f"Task Started | Token: {token} | URL: {video_url}")
+    log(f"Task Started | Token: {token}")
     
     po_token = os.environ.get("YOUTUBE_PO_TOKEN")
     visitor_data = os.environ.get("YOUTUBE_VISITOR_DATA")
@@ -54,13 +51,23 @@ def download_task(token, video_url):
     file_id = str(uuid.uuid4())
     output_template = os.path.join(DOWNLOAD_DIR, f"{file_id}.%(ext)s")
 
-    # Determine cookie path: Secret file takes priority, then local repo file
-    cookie_path = '/etc/secrets/cookies.txt' if os.path.exists('/etc/secrets/cookies.txt') else 'cookies.txt'
+    # --- FAIL-SAFE COOKIE CHECK ---
+    # We check if Render actually mounted the secret file
+    cookie_path = '/etc/secrets/cookies.txt'
+    use_cookies = None
+    if os.path.exists(cookie_path):
+        try:
+            size = os.path.getsize(cookie_path)
+            log(f"Cookie file found at {cookie_path} ({size} bytes)")
+            use_cookies = cookie_path
+        except Exception as e:
+            log(f"Cookie file exists but is unreadable: {e}")
+    else:
+        log("No cookie file found at /etc/secrets/cookies.txt - proceeding without it.")
 
     ydl_opts = {
-        'format': 'wa*/ba*',
+        'format': 'wa*/ba*',  # Smallest audio stream to save RAM
         'outtmpl': output_template,
-        'cookiefile': cookie_path, # Fixed syntax error here
         'postprocessors': [{
             'key': 'FFmpegExtractAudio',
             'preferredcodec': 'mp3',
@@ -73,18 +80,19 @@ def download_task(token, video_url):
             'X-Goog-Visitor-Id': visitor_data if visitor_data else None,
         },
         'proxy': proxy_url if proxy_url else None,
+        'cookiefile': use_cookies,
         'quiet': False,
         'no_warnings': False,
     }
 
     try:
-        log(f"Attempting yt-dlp with Cookie Path: {cookie_path}")
+        log("Invoking yt-dlp engine...")
         with yt_dlp.YoutubeDL(ydl_opts) as ydl:
             ydl.download([video_url])
         
         expected_file = os.path.join(DOWNLOAD_DIR, f"{file_id}.mp3")
         if os.path.exists(expected_file):
-            log(f"SUCCESS | File created for token: {token}")
+            log(f"SUCCESS | File ready for token: {token}")
             active_tokens[token]['file_path'] = expected_file
             active_tokens[token]['status'] = 'ready'
         else:
@@ -96,7 +104,7 @@ def download_task(token, video_url):
         active_tokens[token]['status'] = 'error'
         
         if "sign in" in error_msg.lower() or "confirm you are not a bot" in error_msg.lower():
-            active_tokens[token]['error_message'] = "YouTube Block (Cookies Expired or IP Blacklisted)"
+            active_tokens[token]['error_message'] = "YouTube Block (Identity Triangle Expired)"
         else:
             active_tokens[token]['error_message'] = error_msg
 
@@ -113,6 +121,7 @@ def init_download():
         'file_path': None
     }
 
+    # Start download in background thread
     thread = threading.Thread(target=download_task, args=(token, video_url))
     thread.start()
 
@@ -133,6 +142,7 @@ def get_file():
         return jsonify({"error": task.get('error_message', 'Unknown failure')}), 500
 
     if task['status'] == 'ready':
+        log(f"Serving file for token: {token}")
         return send_file(task['file_path'], as_attachment=True, download_name="audio.mp3")
 
 if __name__ == "__main__":
