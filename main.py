@@ -1,118 +1,121 @@
-"""
-main.py
-Final Production Version: Fixes CORS + YouTube Block + Proxies
-"""
-import os, secrets, threading, time, uuid, requests
-from flask import Flask, request, jsonify, send_from_directory
+import os
+import secrets
+import threading
+import time
+import uuid
+import requests
+from flask import Flask, request, send_file, jsonify
 from flask_cors import CORS
-from pathlib import Path
 import yt_dlp
 
 app = Flask(__name__)
+# Enable CORS for all routes so your React app can talk to it
+CORS(app, resources={r"/*": {"origins": "*"}})
 
-# --- FIX: BROAD CORS FOR DEVELOPMENT ---
-CORS(app, resources={
-    r"/*": {
-        "origins": "*",  # Allows local dev and production
-        "methods": ["GET", "POST", "OPTIONS"],
-        "allow_headers": ["Content-Type", "Authorization"]
-    }
-})
+# Directory for temporary downloads
+DOWNLOAD_DIR = "/tmp/downloads" if os.path.exists("/tmp") else "downloads"
+os.makedirs(DOWNLOAD_DIR, exist_ok=True)
 
-DOWNLOAD_DIR = Path("downloads")
-DOWNLOAD_DIR.mkdir(exist_ok=True)
-REPO_COOKIES_PATH = Path(__file__).resolve().parent / "cookies.txt"
-
+# Shared memory for tracking background tasks
 active_tokens = {}
-TOKEN_EXPIRY = 600
 
-# --- BACKGROUND CLEANUP ---
-def cleanup_expired_files():
+def cleanup_old_files():
+    """Removes files older than 10 minutes to save disk space."""
     while True:
         now = time.time()
-        expired = [t for t, d in active_tokens.items() if now > d["expiry"]]
-        for t in expired:
-            data = active_tokens.pop(t, None)
-            if data and data["file"] and (DOWNLOAD_DIR / data["file"]).exists():
-                (DOWNLOAD_DIR / data["file"]).unlink()
+        for token, data in list(active_tokens.items()):
+            if now - data['timestamp'] > 600:  # 10 minutes
+                file_path = data.get('file_path')
+                if file_path and os.path.exists(file_path):
+                    try:
+                        os.remove(file_path)
+                    except:
+                        pass
+                active_tokens.pop(token, None)
         time.sleep(60)
 
-threading.Thread(target=cleanup_expired_files, daemon=True).start()
+# Start cleanup thread
+threading.Thread(target=cleanup_old_files, daemon=True).start()
 
-# --- CORE DOWNLOAD LOGIC ---
-def run_yt_dlp(video_url, token):
-    po_token = os.getenv("YOUTUBE_PO_TOKEN")
-    visitor_data = os.getenv("YOUTUBE_VISITOR_DATA")
-    proxy_url = os.getenv("PROXY_URL") 
+def download_task(token, video_url):
+    """Background task to download and convert the video."""
+    po_token = os.environ.get("YOUTUBE_PO_TOKEN")
+    visitor_data = os.environ.get("YOUTUBE_VISITOR_DATA")
+    proxy_url = os.environ.get("PROXY_URL")
     
-    filename = f"{token}.mp3"
-    output_path = DOWNLOAD_DIR / filename
+    file_id = str(uuid.uuid4())
+    output_template = os.path.join(DOWNLOAD_DIR, f"{file_id}.%(ext)s")
 
     ydl_opts = {
         'format': 'bestaudio/best',
-        'outtmpl': str(output_path.with_suffix('')),
-        'postprocessors': [{'key': 'FFmpegExtractAudio', 'preferredcodec': 'mp3', 'preferredquality': '192'}],
-        'impersonate': 'chrome', # CRITICAL: Mimics browser TLS
-        'proxy': proxy_url if proxy_url else None, # CRITICAL: Bypasses Data Center Block
-        'extractor_args': {
-            'youtube': {
-                'player_client': ['mweb', 'ios', 'android'],
-                'po_token': [f'web+{po_token}'] if po_token else [],
-                'visitor_data': visitor_data if visitor_data else ""
-            }
+        'outtmpl': output_template,
+        'postprocessors': [{
+            'key': 'FFmpegExtractAudio',
+            'preferredcodec': 'mp3',
+            'preferredquality': '192',
+        }],
+        # Identity Settings
+        'impersonate': 'chrome-110', 
+        'po_token': f"web+none:{po_token}" if po_token else None,
+        'headers': {
+            'X-Goog-Visitor-Id': visitor_data if visitor_data else None,
+            'User-Agent': 'Mozilla/5.0 (iPhone; CPU iPhone OS 16_5 like Mac OS X) AppleWebKit/605.1.15 (KHTML, like Gecko) Version/16.5 Mobile/15E148 Safari/604.1'
         },
-        'http_headers': {
-            'User-Agent': 'Mozilla/5.0 (Linux; Android 6.0; Nexus 5 Build/MRA58N) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/143.0.0.0 Mobile Safari/537.36',
-            'Accept-Language': 'en-GB,en;q=0.9',
-            'Referer': 'https://m.youtube.com/'
-        }
+        'proxy': proxy_url if proxy_url else None,
+        'quiet': True,
+        'no_warnings': True,
     }
-
-    if REPO_COOKIES_PATH.exists():
-        ydl_opts['cookiefile'] = str(REPO_COOKIES_PATH)
 
     try:
         with yt_dlp.YoutubeDL(ydl_opts) as ydl:
             ydl.download([video_url])
-        if token in active_tokens:
-            active_tokens[token].update({"status": "ready", "file": filename})
+        
+        # Mark as complete
+        active_tokens[token]['file_path'] = os.path.join(DOWNLOAD_DIR, f"{file_id}.mp3")
+        active_tokens[token]['status'] = 'ready'
     except Exception as e:
-        print(f"yt-dlp Error: {e}", flush=True)
-        if token in active_tokens:
-            active_tokens[token].update({"status": "error", "error_msg": str(e)})
+        print(f"yt-dlp Error: {str(e)}")
+        active_tokens[token]['status'] = 'error'
+        active_tokens[token]['error_message'] = "YouTube Block" if "500" in str(e) or "sign in" in str(e).lower() else str(e)
 
-# --- ROUTES ---
-@app.route("/", methods=["GET"])
-def start_request():
-    url = request.args.get("url")
-    if not url: return jsonify(error="Missing URL"), 400
+@app.route('/')
+def handle_request():
+    """Accepts a URL and returns a tracking token immediately."""
+    video_url = request.args.get('url')
+    if not video_url:
+        return jsonify({"error": "No URL provided"}), 400
 
-    job_token = str(uuid.uuid4())
-    active_tokens[job_token] = {
-        "file": None,
-        "status": "processing",
-        "expiry": time.time() + TOKEN_EXPIRY,
-        "error_msg": None
+    token = str(uuid.uuid4())
+    active_tokens[token] = {
+        'status': 'processing',
+        'timestamp': time.time(),
+        'file_path': None
     }
 
-    threading.Thread(target=run_yt_dlp, args=(url, job_token), daemon=True).start()
-    return jsonify({"token": job_token})
+    # Start the download in a background thread
+    thread = threading.Thread(target=download_task, args=(token, video_url))
+    thread.start()
 
-@app.route("/download", methods=["GET"])
-def check_or_download():
-    token = request.args.get("token")
-    data = active_tokens.get(token)
+    return jsonify({"token": token})
 
-    if not data: return jsonify(error="Invalid Token"), 404
+@app.route('/download')
+def check_status():
+    """Check if the file is ready or download it."""
+    token = request.args.get('token')
+    if not token or token not in active_tokens:
+        return jsonify({"error": "Invalid Token"}), 404
+
+    task = active_tokens[token]
+
+    if task['status'] == 'processing':
+        return jsonify({"status": "processing"}), 202
     
-    if data["status"] == "processing":
-        return jsonify(status="processing"), 202
-    
-    if data["status"] == "error":
-        return jsonify(error="YouTube Block", detail=data["error_msg"]), 500
+    if task['status'] == 'error':
+        return jsonify({"error": task.get('error_message', 'Unknown Error')}), 500
 
-    return send_from_directory(DOWNLOAD_DIR, path=data["file"], as_attachment=True)
+    if task['status'] == 'ready':
+        return send_file(task['file_path'], as_attachment=True, download_name="audio.mp3")
 
 if __name__ == "__main__":
     port = int(os.environ.get("PORT", 10000))
-    app.run(host="0.0.0.0", port=port)
+    app.run(host='0.0.0.0', port=port)
