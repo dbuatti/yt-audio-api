@@ -54,10 +54,13 @@ def download_task(token, video_url):
     file_id = str(uuid.uuid4())
     output_template = os.path.join(DOWNLOAD_DIR, f"{file_id}.%(ext)s")
 
+    # Determine cookie path: Secret file takes priority, then local repo file
+    cookie_path = '/etc/secrets/cookies.txt' if os.path.exists('/etc/secrets/cookies.txt') else 'cookies.txt'
+
     ydl_opts = {
         'format': 'wa*/ba*',
         'outtmpl': output_template,
-        'cookiefile': '/etc/secrets/cookies.txt
+        'cookiefile': cookie_path, # Fixed syntax error here
         'postprocessors': [{
             'key': 'FFmpegExtractAudio',
             'preferredcodec': 'mp3',
@@ -75,7 +78,7 @@ def download_task(token, video_url):
     }
 
     try:
-        log(f"Attempting yt-dlp with Proxy: {'Yes' if proxy_url else 'No'}")
+        log(f"Attempting yt-dlp with Cookie Path: {cookie_path}")
         with yt_dlp.YoutubeDL(ydl_opts) as ydl:
             ydl.download([video_url])
         
@@ -92,9 +95,8 @@ def download_task(token, video_url):
         log(f"ERROR | Token: {token} | Message: {error_msg}")
         active_tokens[token]['status'] = 'error'
         
-        # User-friendly error mapping
         if "sign in" in error_msg.lower() or "confirm you are not a bot" in error_msg.lower():
-            active_tokens[token]['error_message'] = "YouTube Block (Tokens Expired or Proxy Blacklisted)"
+            active_tokens[token]['error_message'] = "YouTube Block (Cookies Expired or IP Blacklisted)"
         else:
             active_tokens[token]['error_message'] = error_msg
 
@@ -111,7 +113,6 @@ def init_download():
         'file_path': None
     }
 
-    # Launch background thread
     thread = threading.Thread(target=download_task, args=(token, video_url))
     thread.start()
 
@@ -135,6 +136,5 @@ def get_file():
         return send_file(task['file_path'], as_attachment=True, download_name="audio.mp3")
 
 if __name__ == "__main__":
-    # Local dev entry point
     port = int(os.environ.get("PORT", 10000))
     app.run(host='0.0.0.0', port=port)
