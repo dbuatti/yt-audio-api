@@ -38,7 +38,7 @@ def cleanup_old_files():
                 active_tokens.pop(token, None)
         time.sleep(60)
 
-# Start cleanup thread immediately
+# Start cleanup thread
 threading.Thread(target=cleanup_old_files, daemon=True).start()
 
 def download_task(token, video_url):
@@ -59,26 +59,24 @@ def download_task(token, video_url):
             log(f"Found cookie file at: {path} (Size: {os.path.getsize(path)} bytes)")
             use_cookies = path
             break
-    
-    if not use_cookies:
-        log("No cookies.txt found - proceeding with Identity Triangle only.")
 
+    # RAM Optimized Options for Free Tier
     ydl_opts = {
-        'format': 'wa*/ba*',  # Smallest audio stream to save RAM
+        'format': 'wa',  # Smallest audio stream possible
         'outtmpl': output_template,
         'postprocessors': [{
             'key': 'FFmpegExtractAudio',
             'preferredcodec': 'mp3',
-            'preferredquality': '128',
+            'preferredquality': '64', # Lower quality to save RAM during conversion
         }],
-        # Identity Logic (Impersonate removed to fix AssertionError)
         'po_token': f"web+none:{po_token}" if po_token else None,
         'headers': {
             'X-Goog-Visitor-Id': visitor_data if visitor_data else None,
         },
         'proxy': proxy_url if proxy_url else None,
         'cookiefile': use_cookies,
-        'verbose': True, # Keep verbose for debugging the handshake
+        'nocheckcertificate': True, # Reduces SSL overhead
+        'verbose': True, 
         'quiet': False,
     }
 
@@ -94,15 +92,13 @@ def download_task(token, video_url):
             active_tokens[token]['file_path'] = expected_file
             active_tokens[token]['status'] = 'ready'
         else:
-            raise Exception("yt-dlp finished but MP3 file was not found on disk.")
+            raise Exception("yt-dlp finished but file was not found.")
 
     except Exception as e:
         full_trace = traceback.format_exc()
         log(f"CRITICAL ENGINE ERROR | Token: {token}")
         log(f"TRACEBACK: {full_trace}")
-        
         active_tokens[token]['status'] = 'error'
-        # Send actual error back to frontend for visibility
         active_tokens[token]['error_message'] = str(e) if str(e) else "Internal Engine Crash"
 
 @app.route('/')
@@ -118,8 +114,7 @@ def init_download():
         'file_path': None
     }
 
-    log(f"New Request | URL: {video_url} | Token: {token}")
-    # Start download in background thread
+    log(f"New Request | Token: {token}")
     thread = threading.Thread(target=download_task, args=(token, video_url))
     thread.start()
 
@@ -132,22 +127,16 @@ def get_file():
         return jsonify({"error": "Invalid or expired token"}), 404
 
     task = active_tokens[token]
-
     if task['status'] == 'processing':
         return jsonify({"status": "processing"}), 202
     
     if task['status'] == 'error':
-        return jsonify({
-            "status": "error",
-            "error": task.get('error_message'),
-            "debug": "Check Render logs for full Python traceback"
-        }), 500
+        return jsonify({"status": "error", "error": task.get('error_message')}), 500
 
     if task['status'] == 'ready':
         log(f"Serving file for token: {token}")
         return send_file(task['file_path'], as_attachment=True, download_name="audio.mp3")
 
 if __name__ == "__main__":
-    # Local dev entry point
     port = int(os.environ.get("PORT", 10000))
     app.run(host='0.0.0.0', port=port)
