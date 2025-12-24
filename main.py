@@ -20,17 +20,16 @@ from constants import *
 app = Flask(__name__)
 
 # --- UPDATED CORS CONFIGURATION ---
-# We explicitly list the origins to avoid issues with wildcards in some browsers
 CORS(app, resources={
     r"/*": {
         "origins": [
-            "http://localhost:32141",  # Your specific local port
-            "http://localhost:5173",   # Common Vite port
-            "http://127.0.0.1:32141",
-            "https://your-frontend-domain.com" # Add your production URL here later
+            "http://localhost:32141",          # Local Dev
+            "http://localhost:5173",           # Standard Vite Dev
+            "https://gig-studio-pro.vercel.app" # Production
         ],
         "methods": ["GET", "POST", "OPTIONS"],
-        "allow_headers": ["Content-Type", "Authorization"]
+        "allow_headers": ["Content-Type", "Authorization"],
+        "expose_headers": ["Content-Disposition"] # Useful if you need to read the filename in frontend
     }
 })
 
