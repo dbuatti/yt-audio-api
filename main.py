@@ -57,6 +57,7 @@ def download_task(token, video_url):
     ydl_opts = {
         'format': 'wa*/ba*',
         'outtmpl': output_template,
+        'cookiefile': '/etc/secrets/cookies.txt
         'postprocessors': [{
             'key': 'FFmpegExtractAudio',
             'preferredcodec': 'mp3',
