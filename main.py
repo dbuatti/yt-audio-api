@@ -1,165 +1,180 @@
-"""
-main.py
-YouTube Audio Converter API - 2025 Production Edition
-Includes: Proxies, Mobile Identity, Background Processing, and JS Runtime Support
-"""
-
+from flask import Flask, request, send_file, jsonify, make_response
+from flask_cors import CORS
 import os
-import secrets
+import uuid
 import threading
 import time
-import uuid
+import shutil
+import subprocess
 import requests
-from flask import Flask, request, jsonify, send_from_directory
-from flask_cors import CORS
-from pathlib import Path
-import yt_dlp
 
 app = Flask(__name__)
+CORS(app)
 
-# --- CONFIGURATION ---
-CORS(app, resources={
-    r"/*": {
-        "origins": ["http://localhost:5173", "https://gig-studio-pro.vercel.app"],
-        "methods": ["GET", "POST", "OPTIONS"],
-        "allow_headers": ["Content-Type", "Authorization"]
-    }
-})
+DOWNLOAD_DIR = "downloads"
+TOKEN_EXPIRY = 300
+active_tokens = {} # Stores {"file": path, "expiry": timestamp, "error": message}
 
-DOWNLOAD_DIR = Path("downloads")
-DOWNLOAD_DIR.mkdir(exist_ok=True)
+# Configuration for cookies
+COOKIES_FILE = "cookies.txt"
+COOKIES_URL = os.environ.get("COOKIES_URL") # Optional: URL to fetch cookies from
 
-# Path to the cookies file committed to your GitHub repository root
-REPO_COOKIES_PATH = Path(__file__).resolve().parent / "cookies.txt"
+def add_cors_headers(response):
+    response.headers['Access-Control-Allow-Origin'] = '*'
+    response.headers['Access-Control-Allow-Methods'] = 'GET, POST, OPTIONS'
+    response.headers['Access-Control-Allow-Headers'] = 'Content-Type, Authorization'
+    return response
 
-# Stores status of current jobs: {"token": {"file": str, "status": str, "expiry": float, "error": str}}
-active_tokens = {}
-TOKEN_EXPIRY = 600  # 10 minutes
+# Apply CORS headers to all responses
+app.after_request(add_cors_headers)
 
-# --- BACKGROUND CLEANUP ---
-def cleanup_expired_files():
-    """Background thread to delete old MP3s and clear memory."""
-    while True:
-        now = time.time()
-        expired = [t for t, d in active_tokens.items() if now > d["expiry"]]
-        for t in expired:
-            data = active_tokens.pop(t)
-            if data["file"] and (DOWNLOAD_DIR / data["file"]).exists():
-                (DOWNLOAD_DIR / data["file"]).unlink()
-                print(f"--- Cleanup: Deleted {data['file']} ---", flush=True)
-        time.sleep(60)
+def download_cookies():
+    """Download cookies.txt if a URL is provided in environment variables."""
+    if COOKIES_URL:
+        try:
+            print(f"Downloading cookies from {COOKIES_URL}...")
+            response = requests.get(COOKIES_URL)
+            response.raise_for_status()
+            with open(COOKIES_FILE, "w") as f:
+                f.write(response.text)
+            print("Cookies downloaded successfully.")
+        except Exception as e:
+            print(f"Failed to download cookies: {e}")
 
-threading.Thread(target=cleanup_expired_files, daemon=True).start()
-
-# --- CORE DOWNLOAD LOGIC ---
-def run_yt_dlp(video_url, token):
-    """Executes the hardened yt-dlp download using proxies and PO tokens."""
-    po_token = os.getenv("YOUTUBE_PO_TOKEN")
-    visitor_data = os.getenv("YOUTUBE_VISITOR_DATA")
-    proxy_url = os.getenv("PROXY_URL") # Format: http://user:pass@host:port
-    
-    filename = f"{token}.mp3"
-    output_path = DOWNLOAD_DIR / filename
-
-    ydl_opts = {
+def get_ydl_opts(output_path):
+    """Returns yt-dlp options, including cookies if available."""
+    opts = {
         'format': 'bestaudio/best',
-        'outtmpl': str(output_path.with_suffix('')),
+        'outtmpl': output_path.replace('.mp3', ''),
         'postprocessors': [{
             'key': 'FFmpegExtractAudio',
             'preferredcodec': 'mp3',
-            'preferredquality': '192'
+            'preferredquality': '192',
         }],
-        # Mimics a real browser's TLS signature
-        'impersonate': 'chrome',
-        'proxy': proxy_url if proxy_url else None, # Use residential proxy
-        'extractor_args': {
-            'youtube': {
-                'player_client': ['mweb', 'ios', 'android'], # Mobile identity
-                'po_token': [f'web+{po_token}'] if po_token else [],
-                'visitor_data': visitor_data if visitor_data else ""
-            }
-        },
-        'http_headers': {
-            # Matches the session used to generate the PO Token
-            'User-Agent': 'Mozilla/5.0 (Linux; Android 6.0; Nexus 5 Build/MRA58N) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/143.0.0.0 Mobile Safari/537.36',
-            'Accept-Language': 'en-GB,en;q=0.9',
-            'Referer': 'https://m.youtube.com/'
-        }
+        'quiet': True,
+        'no_warnings': True
     }
-
-    if REPO_COOKIES_PATH.exists():
-        ydl_opts['cookiefile'] = str(REPO_COOKIES_PATH)
-
-    try:
-        with yt_dlp.YoutubeDL(ydl_opts) as ydl:
-            ydl.download([video_url])
-        
-        # Update job status as ready
-        if token in active_tokens:
-            active_tokens[token].update({"status": "ready", "file": filename})
-            print(f"--- SUCCESS: {filename} is ready ---", flush=True)
-
-    except Exception as e:
-        print(f"--- yt-dlp Error: {str(e)} ---", flush=True)
-        if token in active_tokens:
-            active_tokens[token].update({"status": "error", "error_msg": str(e)})
-
-# --- ROUTES ---
-@app.route("/", methods=["GET"])
-def start_request():
-    """Initial request returns a token and starts background process."""
-    url = request.args.get("url")
-    if not url:
-        return jsonify(error="Missing URL"), 400
-
-    job_token = str(uuid.uuid4())
-    active_tokens[job_token] = {
-        "file": None,
-        "status": "processing",
-        "expiry": time.time() + TOKEN_EXPIRY,
-        "error_msg": None
-    }
-
-    # Start download in a separate thread to prevent Render timeout
-    threading.Thread(target=run_yt_dlp, args=(url, job_token), daemon=True).start()
     
-    return jsonify({"token": job_token})
-
-@app.route("/download", methods=["GET"])
-def check_or_download():
-    """Checks processing status or serves the file if ready."""
-    token = request.args.get("token")
-    data = active_tokens.get(token)
-
-    if not data:
-        return jsonify(error="Invalid or Expired Token"), 404
-    
-    if data["status"] == "processing":
-        return jsonify(status="processing"), 202
-    
-    if data["status"] == "error":
-        return jsonify(error="YouTube Blocked this request", detail=data["error_msg"]), 500
-
-    # Serve the file
-    try:
-        response = send_from_directory(
-            DOWNLOAD_DIR, 
-            path=data["file"], 
-            as_attachment=True, 
-            mimetype='audio/mpeg'
-        )
-        # Optional: Delete from memory/disk immediately after serving
-        # del active_tokens[token] 
-        return response
-    except Exception as e:
-        return jsonify(error="File not found on server", detail=str(e)), 404
-
-if __name__ == "__main__":
-    # Log cookie status on startup
-    if REPO_COOKIES_PATH.exists():
-        print(f"--- SUCCESS: Found cookies.txt at {REPO_COOKIES_PATH} ---", flush=True)
+    # Add cookies if the file exists
+    if os.path.exists(COOKIES_FILE):
+        opts['cookiefile'] = COOKIES_FILE
+        print("Using cookies file for download.")
     else:
-        print("--- WARNING: No cookies.txt found in repository ---", flush=True)
+        print("No cookies file found. Downloading without cookies (may fail).")
+        
+    return opts
+
+def cleanup_expired_files():
+    while True:
+        current_time = time.time()
+        expired_tokens = []
+        
+        for token, data in active_tokens.items():
+            if current_time > data["expiry"]:
+                expired_tokens.append(token)
+                try:
+                    if data["file"] and os.path.exists(data["file"]):
+                        os.remove(data["file"])
+                        print(f"Deleted expired file: {data['file']}")
+                except Exception as e:
+                    print(f"Error deleting file: {e}")
+        
+        for token in expired_tokens:
+            del active_tokens[token]
+            
+        time.sleep(60)
+
+def download_and_convert(url, token):
+    try:
+        filename = f"{uuid.uuid4()}.mp3"
+        output_path = os.path.join(DOWNLOAD_DIR, filename)
+        
+        # Use the helper to get options
+        ydl_opts = get_ydl_opts(output_path)
+
+        with yt_dlp.YoutubeDL(ydl_opts) as ydl:
+            ydl.download([url])
+
+        if token in active_tokens:
+            active_tokens[token]["file"] = output_path
+            active_tokens[token]["error"] = None # Clear any previous error if successful
+            print(f"Download complete: {output_path}")
+        else:
+            # Token might have expired or been deleted while downloading
+            if os.path.exists(output_path):
+                os.remove(output_path)
+                
+    except Exception as e:
+        print(f"Download failed: {e}")
+        if token in active_tokens:
+            active_tokens[token]["error"] = str(e) # Store the error message
+            
+@app.route('/', methods=['GET', 'OPTIONS'])
+def get_token():
+    if request.method == 'OPTIONS':
+        return '', 204
+        
+    video_url = request.args.get('url')
+    if not video_url:
+        return jsonify({"error": "Missing url parameter"}), 400
+
+    token = str(uuid.uuid4())
+    active_tokens[token] = {
+        "file": None,
+        "expiry": time.time() + TOKEN_EXPIRY,
+        "error": None # Initialize error state
+    }
+
+    threading.Thread(target=download_and_convert, args=(video_url, token), daemon=True).start()
+
+    return jsonify({"token": token})
+
+@app.route('/download', methods=['GET', 'OPTIONS'])
+def download_file():
+    if request.method == 'OPTIONS':
+        return '', 204
+        
+    token = request.args.get('token')
+    if not token:
+        return jsonify({"error": "Missing token parameter"}), 400
+
+    token_data = active_tokens.get(token)
+    if not token_data:
+        return jsonify({"error": "Invalid or expired token"}), 404
+
+    file_path = token_data["file"]
+    error_message = token_data["error"] # Retrieve error message
+
+    if file_path:
+        # File is ready, serve it
+        # Ensure the file exists before sending
+        if not os.path.exists(file_path):
+            del active_tokens[token]
+            return jsonify({"error": "File not found on server after processing"}), 404
+        
+        del active_tokens[token] # Clean up after serving
+        return send_file(file_path, as_attachment=True, download_name="audio.mp3")
+    elif error_message:
+        # An error occurred during download/conversion
+        del active_tokens[token] # Clean up
+        return jsonify({"error": f"Audio processing failed: {error_message}"}), 500
+    else:
+        # Still processing
+        return jsonify({"status": "processing", "message": "File is being prepared. Please try again in a few seconds."}), 202
+
+if __name__ == '__main__':
+    if not os.path.exists(DOWNLOAD_DIR):
+        os.makedirs(DOWNLOAD_DIR)
     
-    port = int(os.environ.get("PORT", 10000))
-    app.run(host="0.0.0.0", port=port)
+    # Download cookies on startup if URL is provided
+    download_cookies()
+    
+    cleanup_thread = threading.Thread(target=cleanup_expired_files, daemon=True)
+    cleanup_thread.start()
+    
+    try:
+        subprocess.run(['ffmpeg', '-version'], stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
+    except FileNotFoundError:
+        print("WARNING: FFmpeg is not installed. Audio conversion will fail.")
+    
+    app.run(host='0.0.0.0', port=10000)
