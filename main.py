@@ -1,67 +1,65 @@
 """
 main.py
-YouTube Audio Converter API - 2025 Final Hardened Edition
-Fixes: Path debugging, CORS, Flask 500 errors, and YouTube Bot Detection
+YouTube Audio Converter API - 2025 Production Edition
+Includes: Proxies, Mobile Identity, Background Processing, and JS Runtime Support
 """
 
 import os
 import secrets
 import threading
+import time
+import uuid
 import requests
-import sys
 from flask import Flask, request, jsonify, send_from_directory
 from flask_cors import CORS
-from uuid import uuid4
 from pathlib import Path
 import yt_dlp
-import access_manager
-from constants import *
 
 app = Flask(__name__)
 
-# --- CORS CONFIGURATION ---
+# --- CONFIGURATION ---
 CORS(app, resources={
     r"/*": {
-        "origins": [
-            "http://localhost:32141",          
-            "http://localhost:5173",           
-            "https://gig-studio-pro.vercel.app" 
-        ],
+        "origins": ["http://localhost:5173", "https://gig-studio-pro.vercel.app"],
         "methods": ["GET", "POST", "OPTIONS"],
-        "allow_headers": ["Content-Type", "Authorization"],
-        "expose_headers": ["Content-Disposition"]
+        "allow_headers": ["Content-Type", "Authorization"]
     }
 })
 
-# --- PATH DEBUGGING & COOKIES ---
-BASE_DIR = Path(__file__).resolve().parent
-REPO_COOKIES_PATH = BASE_DIR / "cookies.txt"
+DOWNLOAD_DIR = Path("downloads")
+DOWNLOAD_DIR.mkdir(exist_ok=True)
 
-# Force check into Render Logs at startup
-print(f"--- STARTUP: Checking for cookies at {REPO_COOKIES_PATH} ---", flush=True)
-if REPO_COOKIES_PATH.exists():
-    print(f"--- SUCCESS: cookies.txt found (Size: {REPO_COOKIES_PATH.stat().st_size} bytes) ---", flush=True)
-else:
-    print("--- WARNING: cookies.txt NOT FOUND in repository root ---", flush=True)
+# Path to the cookies file committed to your GitHub repository root
+REPO_COOKIES_PATH = Path(__file__).resolve().parent / "cookies.txt"
 
-@app.route("/", methods=["GET"])
-def handle_audio_request():
-    video_url = request.args.get("url")
-    if not video_url:
-        return jsonify(error="Missing URL parameter"), 400
+# Stores status of current jobs: {"token": {"file": str, "status": str, "expiry": float, "error": str}}
+active_tokens = {}
+TOKEN_EXPIRY = 600  # 10 minutes
 
-    # Retrieve Tokens from Render Environment
+# --- BACKGROUND CLEANUP ---
+def cleanup_expired_files():
+    """Background thread to delete old MP3s and clear memory."""
+    while True:
+        now = time.time()
+        expired = [t for t, d in active_tokens.items() if now > d["expiry"]]
+        for t in expired:
+            data = active_tokens.pop(t)
+            if data["file"] and (DOWNLOAD_DIR / data["file"]).exists():
+                (DOWNLOAD_DIR / data["file"]).unlink()
+                print(f"--- Cleanup: Deleted {data['file']} ---", flush=True)
+        time.sleep(60)
+
+threading.Thread(target=cleanup_expired_files, daemon=True).start()
+
+# --- CORE DOWNLOAD LOGIC ---
+def run_yt_dlp(video_url, token):
+    """Executes the hardened yt-dlp download using proxies and PO tokens."""
     po_token = os.getenv("YOUTUBE_PO_TOKEN")
     visitor_data = os.getenv("YOUTUBE_VISITOR_DATA")
+    proxy_url = os.getenv("PROXY_URL") # Format: http://user:pass@host:port
     
-    # Debugging Tokens in logs (Partial mask for security)
-    if po_token:
-        print(f"--- Using PO_TOKEN: {po_token[:5]}... ---", flush=True)
-    else:
-        print("--- WARNING: YOUTUBE_PO_TOKEN env var is missing ---", flush=True)
-
-    filename = f"{uuid4()}.mp3"
-    output_path = Path(ABS_DOWNLOADS_PATH) / filename
+    filename = f"{token}.mp3"
+    output_path = DOWNLOAD_DIR / filename
 
     ydl_opts = {
         'format': 'bestaudio/best',
@@ -69,20 +67,20 @@ def handle_audio_request():
         'postprocessors': [{
             'key': 'FFmpegExtractAudio',
             'preferredcodec': 'mp3',
-            'preferredquality': '192',
+            'preferredquality': '192'
         }],
-        # --- 2025 BROWSER IMPERSONATION ---
-        'impersonate': 'chrome', 
-        'quiet': False,
+        # Mimics a real browser's TLS signature
+        'impersonate': 'chrome',
+        'proxy': proxy_url if proxy_url else None, # Use residential proxy
         'extractor_args': {
             'youtube': {
-                'player_client': ['mweb', 'web', 'ios', 'android'],
+                'player_client': ['mweb', 'ios', 'android'], # Mobile identity
                 'po_token': [f'web+{po_token}'] if po_token else [],
                 'visitor_data': visitor_data if visitor_data else ""
             }
         },
         'http_headers': {
-            # Matches your specific Android/Chrome Mobile session found in logs
+            # Matches the session used to generate the PO Token
             'User-Agent': 'Mozilla/5.0 (Linux; Android 6.0; Nexus 5 Build/MRA58N) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/143.0.0.0 Mobile Safari/537.36',
             'Accept-Language': 'en-GB,en;q=0.9',
             'Referer': 'https://m.youtube.com/'
@@ -95,43 +93,73 @@ def handle_audio_request():
     try:
         with yt_dlp.YoutubeDL(ydl_opts) as ydl:
             ydl.download([video_url])
-        return _generate_token_response(filename)
+        
+        # Update job status as ready
+        if token in active_tokens:
+            active_tokens[token].update({"status": "ready", "file": filename})
+            print(f"--- SUCCESS: {filename} is ready ---", flush=True)
+
     except Exception as e:
-        app.logger.error(f"yt-dlp Error: {str(e)}")
-        return jsonify(error="YouTube block", detail=str(e)), 500
+        print(f"--- yt-dlp Error: {str(e)} ---", flush=True)
+        if token in active_tokens:
+            active_tokens[token].update({"status": "error", "error_msg": str(e)})
+
+# --- ROUTES ---
+@app.route("/", methods=["GET"])
+def start_request():
+    """Initial request returns a token and starts background process."""
+    url = request.args.get("url")
+    if not url:
+        return jsonify(error="Missing URL"), 400
+
+    job_token = str(uuid.uuid4())
+    active_tokens[job_token] = {
+        "file": None,
+        "status": "processing",
+        "expiry": time.time() + TOKEN_EXPIRY,
+        "error_msg": None
+    }
+
+    # Start download in a separate thread to prevent Render timeout
+    threading.Thread(target=run_yt_dlp, args=(url, job_token), daemon=True).start()
+    
+    return jsonify({"token": job_token})
 
 @app.route("/download", methods=["GET"])
-def download_audio():
+def check_or_download():
+    """Checks processing status or serves the file if ready."""
     token = request.args.get("token")
-    if not token or not access_manager.has_access(token):
-        return jsonify(error="Invalid or missing token"), 401
+    data = active_tokens.get(token)
+
+    if not data:
+        return jsonify(error="Invalid or Expired Token"), 404
     
+    if data["status"] == "processing":
+        return jsonify(status="processing"), 202
+    
+    if data["status"] == "error":
+        return jsonify(error="YouTube Blocked this request", detail=data["error_msg"]), 500
+
+    # Serve the file
     try:
-        filename = access_manager.get_audio_file(token)
-        access_manager.invalidate_token(token)
-        
-        # path= filename fixes the Flask 500 error found in logs
-        return send_from_directory(
-            ABS_DOWNLOADS_PATH, 
-            path=filename, 
+        response = send_from_directory(
+            DOWNLOAD_DIR, 
+            path=data["file"], 
             as_attachment=True, 
             mimetype='audio/mpeg'
         )
+        # Optional: Delete from memory/disk immediately after serving
+        # del active_tokens[token] 
+        return response
     except Exception as e:
-        app.logger.error(f"Download route error: {e}")
-        return jsonify(error="File error"), 404
-
-def _generate_token_response(filename: str):
-    token = secrets.token_urlsafe(TOKEN_LENGTH)
-    access_manager.add_token(token, filename)
-    return jsonify(token=token), 200
-
-def start_token_cleaner():
-    threading.Thread(target=access_manager.manage_tokens, daemon=True).start()
-
-with app.app_context():
-    start_token_cleaner()
+        return jsonify(error="File not found on server", detail=str(e)), 404
 
 if __name__ == "__main__":
-    port = int(os.environ.get("PORT", 5000))
+    # Log cookie status on startup
+    if REPO_COOKIES_PATH.exists():
+        print(f"--- SUCCESS: Found cookies.txt at {REPO_COOKIES_PATH} ---", flush=True)
+    else:
+        print("--- WARNING: No cookies.txt found in repository ---", flush=True)
+    
+    port = int(os.environ.get("PORT", 10000))
     app.run(host="0.0.0.0", port=port)
