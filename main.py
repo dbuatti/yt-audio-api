@@ -24,11 +24,12 @@ os.makedirs(DOWNLOAD_DIR, exist_ok=True)
 active_tokens = {}
 
 def cleanup_old_files():
-    """Background loop to prevent /tmp from filling up."""
+    """Background loop to prevent /tmp from filling up and crashing the server."""
     while True:
         now = time.time()
         for token, data in list(active_tokens.items()):
-            if now - data['timestamp'] > 600:  # 10 minutes
+            # Cleanup files older than 10 minutes
+            if now - data['timestamp'] > 600:
                 file_path = data.get('file_path')
                 if file_path and os.path.exists(file_path):
                     try:
@@ -39,16 +40,15 @@ def cleanup_old_files():
                 active_tokens.pop(token, None)
         time.sleep(60)
 
-# Start cleanup thread
+# Start cleanup thread immediately
 threading.Thread(target=cleanup_old_files, daemon=True).start()
 
 def download_task(token, video_url):
     log(f"--- STARTING DOWNLOAD TASK | Token: {token} ---")
     
-    # Progress Hook to capture percentage for the frontend
+    # Progress Hook to update the polling dictionary
     def progress_hook(d):
         if d['status'] == 'downloading':
-            # Extract percentage from the yt-dlp data dictionary
             p = d.get('_percent_str', '0%').replace('%','')
             try:
                 active_tokens[token]['progress'] = float(p)
@@ -64,25 +64,27 @@ def download_task(token, video_url):
     file_id = str(uuid.uuid4())
     output_template = os.path.join(DOWNLOAD_DIR, f"{file_id}.%(ext)s")
 
-    # Support for both GitHub and Render Secret cookie paths
+    # Resolve cookie path (Root or Render Secret)
     paths_to_check = ['./cookies.txt', '/etc/secrets/cookies.txt']
     use_cookies = None
     for path in paths_to_check:
         if os.path.exists(path):
-            log(f"Found cookie file at: {path} (Size: {os.path.getsize(path)} bytes)")
+            log(f"Using cookies from: {path}")
             use_cookies = path
             break
 
+    # RAM and Performance Optimized Options
     ydl_opts = {
-        'format': 'wa',  # Smallest audio stream to save RAM
+        'format': 'wa',            # Smallest audio stream to save RAM/Disk
+        'noplaylist': True,        # CRITICAL: Prevents downloading hundreds of songs in a mix
         'outtmpl': output_template,
-        'progress_hooks': [progress_hook], # Integrated progress tracking
+        'progress_hooks': [progress_hook],
         'postprocessors': [{
             'key': 'FFmpegExtractAudio',
             'preferredcodec': 'mp3',
-            'preferredquality': '64', # Lower quality for faster conversion on Free Tier
+            'preferredquality': '64', # Lower bitrate for faster processing on Free Tier
         }],
-        # Identity Logic (Bypasses bot detection)
+        # YouTube Bypass Identity logic
         'po_token': f"web+none:{po_token}" if po_token else None,
         'headers': {
             'X-Goog-Visitor-Id': visitor_data if visitor_data else None,
@@ -90,14 +92,13 @@ def download_task(token, video_url):
         'proxy': proxy_url if proxy_url else None,
         'cookiefile': use_cookies,
         'nocheckcertificate': True,
-        'verbose': True, # Keep verbose for morning log review
+        'verbose': True,           # Useful for identifying blocked proxies
         'quiet': False,
     }
 
     try:
-        log("Engine Initializing...")
+        log(f"Invoking yt-dlp for URL: {video_url}")
         with yt_dlp.YoutubeDL(ydl_opts) as ydl:
-            log(f"Running ydl.download for: {video_url}")
             ydl.download([video_url])
         
         expected_file = os.path.join(DOWNLOAD_DIR, f"{file_id}.mp3")
@@ -106,11 +107,11 @@ def download_task(token, video_url):
             active_tokens[token]['file_path'] = expected_file
             active_tokens[token]['status'] = 'ready'
         else:
-            raise Exception("yt-dlp finished but MP3 file was not found on disk.")
+            raise Exception("yt-dlp finished but MP3 was not found.")
 
     except Exception as e:
         full_trace = traceback.format_exc()
-        log(f"CRITICAL ENGINE ERROR | Token: {token}")
+        log(f"CRITICAL ERROR | Token: {token}")
         log(f"TRACEBACK: {full_trace}")
         
         active_tokens[token]['status'] = 'error'
@@ -125,15 +126,14 @@ def init_download():
     token = str(uuid.uuid4())
     active_tokens[token] = {
         'status': 'processing',
-        'progress': 0, # Initial progress state
+        'progress': 0,
         'timestamp': time.time(),
         'file_path': None
     }
 
     log(f"New Request | Token: {token}")
-    # Start download in background thread
-    thread = threading.Thread(target=download_task, args=(token, video_url))
-    thread.start()
+    # Run download in a background thread to prevent Flask timeout
+    threading.Thread(target=download_task, args=(token, video_url)).start()
 
     return jsonify({"token": token})
 
@@ -146,7 +146,6 @@ def get_file():
     task = active_tokens[token]
 
     if task['status'] == 'processing':
-        # Return progress percentage to the React frontend
         return jsonify({
             "status": "processing", 
             "progress": task.get('progress', 0)
