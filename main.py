@@ -1,7 +1,7 @@
 """
 main.py
 YouTube Audio Converter API - Fully optimized for Render.com (Docker)
-Features: CORS, dynamic cookies from Supabase, realistic headers, robust error handling
+Features: Fixed CORS for Local Dev, dynamic cookies, robust error handling
 """
 
 import os
@@ -19,13 +19,23 @@ from constants import *
 # Initialize Flask app
 app = Flask(__name__)
 
-# Robust CORS: Allows your local frontend and production domain
-CORS(app, origins=["http://localhost:*", "https://*"], supports_credentials=True)
-
+# --- UPDATED CORS CONFIGURATION ---
+# We explicitly list the origins to avoid issues with wildcards in some browsers
+CORS(app, resources={
+    r"/*": {
+        "origins": [
+            "http://localhost:32141",  # Your specific local port
+            "http://localhost:5173",   # Common Vite port
+            "http://127.0.0.1:32141",
+            "https://your-frontend-domain.com" # Add your production URL here later
+        ],
+        "methods": ["GET", "POST", "OPTIONS"],
+        "allow_headers": ["Content-Type", "Authorization"]
+    }
+})
 
 # Path for temporary cookies file
 COOKIES_FILE_PATH = Path("/tmp/cookies.txt")
-
 
 def download_cookies_from_url():
     """Download fresh cookies.txt from COOKIES_URL env var (Supabase public URL)"""
@@ -48,21 +58,18 @@ def download_cookies_from_url():
         app.logger.error(f"Failed to download cookies: {str(e)}")
         return False
 
-
 # Download cookies at startup
 download_cookies_from_url()
 
-
-@app.route("/", methods=["GET", "OPTIONS"])
+@app.route("/", methods=["GET"])
 def handle_audio_request():
-    if request.method == "OPTIONS":
-        return "", 204  # Preflight response
-
+    # flask-cors handles the OPTIONS/Preflight automatically now
+    
     video_url = request.args.get("url")
     if not video_url:
-        return jsonify(error="Missing 'url' parameter."), BAD_REQUEST
+        return jsonify(error="Missing 'url' parameter."), 400
 
-    # Refresh cookies on every request
+    # Refresh cookies on every request to ensure they aren't stale
     download_cookies_from_url()
 
     filename = f"{uuid4()}.mp3"
@@ -79,7 +86,7 @@ def handle_audio_request():
         'quiet': True,
         'no_warnings': True,
         'http_headers': {
-            'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/142.0.0.0 Safari/537.36',
+            'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36',
             'Accept-Language': 'en-US,en;q=0.9',
             'Referer': 'https://www.youtube.com/',
         },
@@ -111,7 +118,7 @@ def handle_audio_request():
 def download_audio():
     token = request.args.get("token")
     if not token:
-        return jsonify(error="Missing 'token' parameter."), BAD_REQUEST
+        return jsonify(error="Missing 'token' parameter."), 400
 
     if not access_manager.has_access(token):
         return jsonify(error="Invalid or unknown token."), 401
@@ -123,7 +130,7 @@ def download_audio():
         filename = access_manager.get_audio_file(token)
         directory = ABS_DOWNLOADS_PATH
         access_manager.invalidate_token(token)  # One-time use
-        return send_from_directory(directory, filename=filename, as_attachment=True, mimetype='audio/mpeg')
+        return send_from_directory(directory, path=filename, as_attachment=True, mimetype='audio/mpeg')
     except FileNotFoundError:
         return jsonify(error="File not found on server."), 404
     except Exception as e:
@@ -148,4 +155,6 @@ with app.app_context():
 
 
 if __name__ == "__main__":
+    # Note: When running on Render via Gunicorn, this block is ignored.
+    # The port is handled by the Docker CMD.
     app.run(host="0.0.0.0", port=5000, debug=False)
