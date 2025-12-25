@@ -74,25 +74,21 @@ def download_task(token, video_url):
             break
 
     # RAM and Performance Optimized Options
-    ydl_opts = {
-        'format': 'wa',            # Smallest audio stream to save RAM/Disk
-        'noplaylist': True,        # CRITICAL: Prevents downloading hundreds of songs in a mix
+ydl_opts = {
+        'format': 'wa',  
+        'noplaylist': True,
         'outtmpl': output_template,
         'progress_hooks': [progress_hook],
         'postprocessors': [{
             'key': 'FFmpegExtractAudio',
             'preferredcodec': 'mp3',
-            'preferredquality': '64', # Lower bitrate for faster processing on Free Tier
+            'preferredquality': '128', # Increased from 64 to 128
         }],
-        # YouTube Bypass Identity logic
         'po_token': f"web+none:{po_token}" if po_token else None,
-        'headers': {
-            'X-Goog-Visitor-Id': visitor_data if visitor_data else None,
-        },
+        'headers': {'X-Goog-Visitor-Id': visitor_data if visitor_data else None},
         'proxy': proxy_url if proxy_url else None,
         'cookiefile': use_cookies,
         'nocheckcertificate': True,
-        'verbose': True,           # Useful for identifying blocked proxies
         'quiet': False,
     }
 
