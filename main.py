@@ -74,15 +74,15 @@ def download_task(token, video_url):
             break
 
     # RAM and Performance Optimized Options
-ydl_opts = {
+    ydl_opts = {
         'format': 'wa',  
-        'noplaylist': True,
+        'noplaylist': True, # Prevents downloading hundreds of songs in a mix
         'outtmpl': output_template,
         'progress_hooks': [progress_hook],
         'postprocessors': [{
             'key': 'FFmpegExtractAudio',
             'preferredcodec': 'mp3',
-            'preferredquality': '128', # Increased from 64 to 128
+            'preferredquality': '128', # Higher quality (Step 2)
         }],
         'po_token': f"web+none:{po_token}" if po_token else None,
         'headers': {'X-Goog-Visitor-Id': visitor_data if visitor_data else None},
