@@ -4,31 +4,35 @@ import time
 import uuid
 import sys
 import traceback
-from flask import Flask, request, send_file, jsonify
+from flask import Flask, request, send_file, jsonify, make_response
 from flask_cors import CORS
 import yt_dlp
 
 app = Flask(__name__)
-# Enable CORS for your React frontend
-CORS(app, resources={r"/*": {"origins": "*"}})
 
-# Explicit logging for Render's log viewer
+# Enhanced CORS configuration to ensure cross-origin file downloads work
+CORS(app, resources={
+    r"/*": {
+        "origins": "*",
+        "methods": ["GET", "POST", "OPTIONS"],
+        "allow_headers": ["Content-Type", "Authorization", "X-Requested-With"]
+    }
+})
+
 def log(message):
     print(f"[SERVER LOG] {message}")
     sys.stdout.flush()
 
-# Use /tmp for Render's ephemeral storage
 DOWNLOAD_DIR = "/tmp/downloads"
 os.makedirs(DOWNLOAD_DIR, exist_ok=True)
 
 active_tokens = {}
 
 def cleanup_old_files():
-    """Background loop to prevent /tmp from filling up and crashing the server."""
+    """Removes files older than 10 mins to stay within Render's disk limits."""
     while True:
         now = time.time()
         for token, data in list(active_tokens.items()):
-            # Cleanup files older than 10 minutes
             if now - data['timestamp'] > 600:
                 file_path = data.get('file_path')
                 if file_path and os.path.exists(file_path):
@@ -40,13 +44,11 @@ def cleanup_old_files():
                 active_tokens.pop(token, None)
         time.sleep(60)
 
-# Start cleanup thread immediately
 threading.Thread(target=cleanup_old_files, daemon=True).start()
 
 def download_task(token, video_url):
     log(f"--- STARTING DOWNLOAD TASK | Token: {token} ---")
     
-    # Progress Hook to update the polling dictionary
     def progress_hook(d):
         if d['status'] == 'downloading':
             p = d.get('_percent_str', '0%').replace('%','')
@@ -64,7 +66,6 @@ def download_task(token, video_url):
     file_id = str(uuid.uuid4())
     output_template = os.path.join(DOWNLOAD_DIR, f"{file_id}.%(ext)s")
 
-    # Resolve cookie path (Root or Render Secret)
     paths_to_check = ['./cookies.txt', '/etc/secrets/cookies.txt']
     use_cookies = None
     for path in paths_to_check:
@@ -73,22 +74,22 @@ def download_task(token, video_url):
             use_cookies = path
             break
 
-    # RAM and Performance Optimized Options
     ydl_opts = {
-        'format': 'wa',  
-        'noplaylist': True, # Prevents downloading hundreds of songs in a mix
+        'format': 'wa',
+        'noplaylist': True,  # Ensures only the specific song is downloaded
         'outtmpl': output_template,
         'progress_hooks': [progress_hook],
         'postprocessors': [{
             'key': 'FFmpegExtractAudio',
             'preferredcodec': 'mp3',
-            'preferredquality': '128', # Higher quality (Step 2)
+            'preferredquality': '128', # High quality 128kbps
         }],
         'po_token': f"web+none:{po_token}" if po_token else None,
         'headers': {'X-Goog-Visitor-Id': visitor_data if visitor_data else None},
         'proxy': proxy_url if proxy_url else None,
         'cookiefile': use_cookies,
         'nocheckcertificate': True,
+        'verbose': True,
         'quiet': False,
     }
 
@@ -106,12 +107,9 @@ def download_task(token, video_url):
             raise Exception("yt-dlp finished but MP3 was not found.")
 
     except Exception as e:
-        full_trace = traceback.format_exc()
-        log(f"CRITICAL ERROR | Token: {token}")
-        log(f"TRACEBACK: {full_trace}")
-        
+        log(f"CRITICAL ERROR | Token: {token} | {str(e)}")
         active_tokens[token]['status'] = 'error'
-        active_tokens[token]['error_message'] = str(e) if str(e) else "Internal Engine Crash"
+        active_tokens[token]['error_message'] = str(e)
 
 @app.route('/')
 def init_download():
@@ -128,9 +126,7 @@ def init_download():
     }
 
     log(f"New Request | Token: {token}")
-    # Run download in a background thread to prevent Flask timeout
     threading.Thread(target=download_task, args=(token, video_url)).start()
-
     return jsonify({"token": token})
 
 @app.route('/download')
@@ -148,14 +144,19 @@ def get_file():
         }), 202
     
     if task['status'] == 'error':
-        return jsonify({
-            "status": "error", 
-            "error": task.get('error_message')
-        }), 500
+        return jsonify({"status": "error", "error": task.get('error_message')}), 500
 
     if task['status'] == 'ready':
         log(f"Serving file for token: {token}")
-        return send_file(task['file_path'], as_attachment=True, download_name="audio.mp3")
+        # Explicitly creating response to add manual CORS headers
+        response = make_response(send_file(
+            task['file_path'], 
+            as_attachment=True, 
+            download_name="audio.mp3",
+            mimetype="audio/mpeg"
+        ))
+        response.headers.add("Access-Control-Allow-Origin", "*")
+        return response
 
 if __name__ == "__main__":
     port = int(os.environ.get("PORT", 10000))
