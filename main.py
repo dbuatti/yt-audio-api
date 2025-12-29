@@ -4,6 +4,7 @@ import time
 import uuid
 import sys
 import traceback
+import gc
 from flask import Flask, request, send_file, jsonify, make_response
 from flask_cors import CORS
 import yt_dlp
@@ -19,9 +20,9 @@ CORS(app, resources={
     }
 })
 
-# CONCURRENCY CONTROL: Only allow 2 heavy Deno/FFmpeg tasks at once
-# This prevents the Out-of-Memory (OOM) crash during bulk refreshes.
-download_semaphore = threading.BoundedSemaphore(value=2)
+# MAX SAFETY CONCURRENCY: Set to 1 for 512MB RAM servers
+# This forces the server to finish one song completely before starting the next.
+download_semaphore = threading.BoundedSemaphore(value=1)
 
 def log(message):
     print(f"[SERVER LOG] {message}")
@@ -46,12 +47,15 @@ def cleanup_old_files():
                     except Exception as e:
                         log(f"Cleanup error: {e}")
                 active_tokens.pop(token, None)
+        # Clear memory after cleanup
+        gc.collect()
         time.sleep(60)
 
 threading.Thread(target=cleanup_old_files, daemon=True).start()
 
 def download_task(token, video_url):
-    # Wait here if 2 tasks are already running
+    # Wait here if another task is running.
+    # This prevents the 512MB RAM Out-Of-Memory crash.
     with download_semaphore:
         log(f"--- STARTING DOWNLOAD TASK | Token: {token} ---")
         
@@ -90,7 +94,7 @@ def download_task(token, video_url):
             'proxy': proxy_url if proxy_url else None,
             'cookiefile': use_cookies,
             'nocheckcertificate': True,
-            'verbose': True,
+            'verbose': False, # Reduced verbosity to save log memory
             'quiet': False,
         }
 
@@ -104,12 +108,15 @@ def download_task(token, video_url):
                 active_tokens[token]['file_path'] = expected_file
                 active_tokens[token]['status'] = 'ready'
             else:
-                raise Exception("Conversion Error")
+                raise Exception("File not found after conversion")
 
         except Exception as e:
             log(f"ERROR | {token} | {str(e)}")
             active_tokens[token]['status'] = 'error'
             active_tokens[token]['error_message'] = str(e)
+        
+        # Force Python to release memory after each song
+        gc.collect()
 
 @app.route('/')
 def init_download():
