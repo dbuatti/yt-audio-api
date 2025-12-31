@@ -9,8 +9,7 @@ from flask_cors import CORS
 import yt_dlp
 from supabase import create_client, Client
 
-# --- IMMEDIATE STARTUP LOG ---
-# This forces a log to appear the moment Render starts the process
+# --- Startup Log ---
 print("[SYSTEM] >>> PYTHON WORKER SCRIPT INITIALIZING <<<", flush=True)
 
 app = Flask(__name__)
@@ -31,9 +30,8 @@ DOWNLOAD_DIR = "/tmp/downloads"
 os.makedirs(DOWNLOAD_DIR, exist_ok=True)
 
 def log(message):
-    """Custom log function with immediate flushing for Render logs."""
+    """Custom log function with immediate flushing for real-time Render logs."""
     timestamp = time.strftime("%H:%M:%S")
-    # flush=True is the key to seeing logs in real-time on Render
     print(f"[{timestamp}] [WORKER] {message}", flush=True)
 
 # --- Extraction Logic ---
@@ -53,7 +51,7 @@ def process_queued_song(song):
         try:
             log(f">>> STARTING EXTRACTION: {title}")
             
-            # 1. Update status to 'processing' in Supabase
+            # 1. Mark as processing in DB
             supabase.table("repertoire").update({"extraction_status": "processing"}).eq("id", song_id).execute()
 
             file_id = str(uuid.uuid4())
@@ -76,34 +74,43 @@ def process_queued_song(song):
                 'no_warnings': True
             }
 
-            log(f"Downloading from YouTube: {title}")
+            # 2. Download from YouTube
+            log(f"Downloading from YouTube...")
             with yt_dlp.YoutubeDL(ydl_opts) as ydl:
                 ydl.download([video_url])
             
             mp3_path = os.path.join(DOWNLOAD_DIR, f"{file_id}.mp3")
             
             if os.path.exists(mp3_path):
-                log(f"Upload starting: {title}")
+                log(f"Upload starting for {title}...")
+                
+                # FIX: Define storage path correctly
+                # Using a timestamp to prevent browser caching issues
                 storage_path = f"{user_id}/{song_id}/{int(time.time())}.mp3"
                 
-                # 3. Upload to Supabase Storage
+                # 3. Upload file to Supabase Storage
                 with open(mp3_path, 'rb') as f:
                     supabase.storage.from_("public_audio").upload(
                         path=storage_path, 
                         file=f,
-                        file_options={"content-type": "audio/mpeg"}
+                        file_options={"content-type": "audio/mpeg", "x-upsert": "true"}
                     )
                 
-                # 4. Finalize Database Record
+                # 4. Get the Public URL
                 public_url = supabase.storage.from_("public_audio").get_public_url(storage_path)
                 
+                # 5. Update DB: Save URL to BOTH audio_url and preview_url
+                # This ensures the gig reader sees the song as "Ready"
                 supabase.table("repertoire").update({
                     "audio_url": public_url,
+                    "preview_url": public_url,
                     "extraction_status": "completed",
                     "extraction_error": None
                 }).eq("id", song_id).execute()
                 
                 log(f"SUCCESS: Finished {title}")
+                
+                # Cleanup local file to save Render disk space
                 if os.path.exists(mp3_path):
                     os.remove(mp3_path)
             else:
@@ -128,9 +135,7 @@ def job_poller():
     log("Job Poller initialization complete. Scanning for work...")
     while True:
         try:
-            # Heartbeat log to prove the worker is still alive
-            log("Heartbeat: Checking Supabase for 'queued' jobs...")
-            
+            # log("Heartbeat: Checking for jobs...")
             res = supabase.table("repertoire")\
                 .select("id, youtube_url, user_id, title")\
                 .eq("extraction_status", "queued")\
@@ -151,15 +156,14 @@ def job_poller():
 worker_thread = threading.Thread(target=job_poller, daemon=True)
 worker_thread.start()
 
-# --- Routes for Health Monitoring ---
-
+# --- Health Check Route ---
 @app.route('/')
 def status():
     return jsonify({
         "status": "online",
         "worker_active": worker_thread.is_alive(),
         "mode": "background_worker",
-        "heartbeat": time.strftime("%H:%M:%S")
+        "timestamp": time.strftime("%H:%M:%S")
     }), 200
 
 if __name__ == "__main__":
