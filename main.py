@@ -13,7 +13,6 @@ app = Flask(__name__)
 CORS(app)
 
 # --- Configuration ---
-# Ensure these are set in Render Dashboard -> Settings -> Environment Variables
 SUPABASE_URL = os.environ.get("SUPABASE_URL")
 SUPABASE_KEY = os.environ.get("SUPABASE_SERVICE_ROLE_KEY")
 
@@ -29,7 +28,6 @@ DOWNLOAD_DIR = "/tmp/downloads"
 os.makedirs(DOWNLOAD_DIR, exist_ok=True)
 
 def log(message):
-    # Includes timestamp for easier debugging in Render
     timestamp = time.strftime("%H:%M:%S")
     print(f"[{timestamp}] [WORKER] {message}")
     sys.stdout.flush()
@@ -42,14 +40,12 @@ def process_queued_song(song):
     user_id = song.get('user_id')
     title = song.get('title', 'Unknown Title')
 
-    # Ensure we have the minimum requirements
-    if not song_id or not video_url or not user_id:
-        log(f"Skipping song {title}: Missing ID, URL, or UserID")
-        supabase.table("repertoire").update({
-            "extraction_status": "failed",
-            "extraction_error": "Missing metadata (ID, URL, or UserID)"
-        }).eq("id", song_id).execute()
-        return
+    # Get credentials from Render Environment Variables for Bot Protection
+    po_token = os.environ.get("YOUTUBE_PO_TOKEN")
+    visitor_data = os.environ.get("YOUTUBE_VISITOR_DATA")
+    
+    # Path for cookies file in the repo
+    cookie_path = './cookies.txt' if os.path.exists('./cookies.txt') else None
 
     with download_semaphore:
         try:
@@ -70,12 +66,16 @@ def process_queued_song(song):
                     'preferredcodec': 'mp3',
                     'preferredquality': '128',
                 }],
+                # --- BOT PROTECTION ---
+                'cookiefile': cookie_path,
+                'po_token': f"web+none:{po_token}" if po_token else None,
+                'headers': {'X-Goog-Visitor-Id': visitor_data} if visitor_data else {},
+                # ----------------------
                 'nocheckcertificate': True,
                 'quiet': True,
                 'no_warnings': True
             }
 
-            # 2. Extract from YouTube
             log(f"Downloading from YouTube...")
             with yt_dlp.YoutubeDL(ydl_opts) as ydl:
                 ydl.download([video_url])
@@ -112,10 +112,15 @@ def process_queued_song(song):
         except Exception as e:
             error_msg = str(e)
             log(f"FAILED: {title} | Error: {error_msg}")
-            supabase.table("repertoire").update({
-                "extraction_status": "failed",
-                "extraction_error": error_msg
-            }).eq("id", song_id).execute()
+            
+            # Attempt to log the error to the database
+            try:
+                supabase.table("repertoire").update({
+                    "extraction_status": "failed",
+                    "extraction_error": error_msg[:255] # Truncate to avoid column length issues
+                }).eq("id", song_id).execute()
+            except Exception as db_err:
+                log(f"Could not update Supabase failure status: {db_err}")
         finally:
             gc.collect()
 
@@ -124,41 +129,34 @@ def job_poller():
     log("Job Poller initialized and hunting for work...")
     while True:
         try:
-            # 1. Heartbeat log so you know the script hasn't frozen
-            log("Heartbeat: Checking Supabase for 'queued' rows...")
-            
-            # 2. Look for work
+            # log("Heartbeat: Checking Supabase...")
             res = supabase.table("repertoire")\
                 .select("id, youtube_url, user_id, title")\
                 .eq("extraction_status", "queued")\
                 .limit(1)\
                 .execute()
             
-            # 3. If work exists, process it
             if res.data and len(res.data) > 0:
-                log(f"Found {len(res.data)} job(s). Picking up: {res.data[0].get('title')}")
+                log(f"Found job! Picking up: {res.data[0].get('title')}")
                 process_queued_song(res.data[0])
             else:
-                # No work, sleep for 20s
                 time.sleep(20)
                 
         except Exception as e:
             log(f"Poller Loop Error: {e}")
             time.sleep(30)
 
-# Start poller thread immediately
+# Start poller thread
 worker_thread = threading.Thread(target=job_poller, daemon=True)
 worker_thread.start()
 
-# --- Web Routes (For Health Checks) ---
+# --- Health Check Route ---
 
 @app.route('/')
 def status():
-    # Show if the thread is actually running
-    is_alive = worker_thread.is_alive()
     return jsonify({
         "status": "online",
-        "worker_thread_active": is_alive,
+        "worker_active": worker_thread.is_alive(),
         "mode": "background_worker"
     }), 200
 
