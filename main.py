@@ -22,7 +22,7 @@ if not SUPABASE_URL or not SUPABASE_KEY:
 
 supabase: Client = create_client(SUPABASE_URL, SUPABASE_KEY)
 
-# Safety Controls
+# Safety Controls: 1 task at a time for 512MB RAM
 download_semaphore = threading.BoundedSemaphore(value=1)
 DOWNLOAD_DIR = "/tmp/downloads"
 os.makedirs(DOWNLOAD_DIR, exist_ok=True)
@@ -40,11 +40,9 @@ def process_queued_song(song):
     user_id = song.get('user_id')
     title = song.get('title', 'Unknown Title')
 
-    # Get credentials from Render Environment Variables for Bot Protection
+    # Get credentials for Bot Protection
     po_token = os.environ.get("YOUTUBE_PO_TOKEN")
     visitor_data = os.environ.get("YOUTUBE_VISITOR_DATA")
-    
-    # Path for cookies file in the repo
     cookie_path = './cookies.txt' if os.path.exists('./cookies.txt') else None
 
     with download_semaphore:
@@ -58,7 +56,8 @@ def process_queued_song(song):
             output_template = os.path.join(DOWNLOAD_DIR, f"{file_id}.%(ext)s")
             
             ydl_opts = {
-                'format': 'wa',
+                # FIX: Use bestaudio/best for maximum compatibility across all videos
+                'format': 'bestaudio/best', 
                 'noplaylist': True,
                 'outtmpl': output_template,
                 'postprocessors': [{
@@ -113,11 +112,10 @@ def process_queued_song(song):
             error_msg = str(e)
             log(f"FAILED: {title} | Error: {error_msg}")
             
-            # Attempt to log the error to the database
             try:
                 supabase.table("repertoire").update({
                     "extraction_status": "failed",
-                    "extraction_error": error_msg[:255] # Truncate to avoid column length issues
+                    "extraction_error": error_msg[:255]
                 }).eq("id", song_id).execute()
             except Exception as db_err:
                 log(f"Could not update Supabase failure status: {db_err}")
@@ -125,11 +123,10 @@ def process_queued_song(song):
             gc.collect()
 
 def job_poller():
-    """Background loop that checks for 'queued' songs."""
+    """Background loop that checks for 'queued' songs every 20 seconds."""
     log("Job Poller initialized and hunting for work...")
     while True:
         try:
-            # log("Heartbeat: Checking Supabase...")
             res = supabase.table("repertoire")\
                 .select("id, youtube_url, user_id, title")\
                 .eq("extraction_status", "queued")\
@@ -151,7 +148,6 @@ worker_thread = threading.Thread(target=job_poller, daemon=True)
 worker_thread.start()
 
 # --- Health Check Route ---
-
 @app.route('/')
 def status():
     return jsonify({
