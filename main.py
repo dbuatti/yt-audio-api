@@ -45,6 +45,7 @@ def process_queued_song(song):
     # Auth Credentials for YouTube Bot Protection
     po_token = os.environ.get("YOUTUBE_PO_TOKEN")
     visitor_data = os.environ.get("YOUTUBE_VISITOR_DATA")
+    # Priority: Use environment variable or local file
     cookie_path = './cookies.txt' if os.path.exists('./cookies.txt') else None
 
     with download_semaphore:
@@ -57,6 +58,7 @@ def process_queued_song(song):
             file_id = str(uuid.uuid4())
             output_template = os.path.join(DOWNLOAD_DIR, f"{file_id}.%(ext)s")
             
+            # Refined options to prevent "Empty File" errors
             ydl_opts = {
                 'format': 'bestaudio/best', 
                 'noplaylist': True,
@@ -67,25 +69,39 @@ def process_queued_song(song):
                     'preferredquality': '128',
                 }],
                 'cookiefile': cookie_path,
-                'po_token': f"web+none:{po_token}" if po_token else None,
-                'headers': {'X-Goog-Visitor-Id': visitor_data} if visitor_data else {},
+                # New standard User-Agent to prevent bot flagging
+                'user_agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36',
+                # Updated Token handling
+                'params': {
+                    'po_token': [po_token] if po_token else None,
+                },
+                'headers': {
+                    'X-Goog-Visitor-Id': visitor_data
+                } if visitor_data else {},
                 'nocheckcertificate': True,
-                'quiet': True,
-                'no_warnings': True
+                'quiet': False, # Disabled quiet mode to debug "Empty File" in Render logs
+                'no_warnings': False,
+                'extract_flat': False,
             }
 
             # 2. Download from YouTube
-            log(f"Downloading from YouTube...")
+            log(f"Downloading from YouTube: {video_url}")
             with yt_dlp.YoutubeDL(ydl_opts) as ydl:
-                ydl.download([video_url])
+                error_code = ydl.download([video_url])
+                if error_code != 0:
+                    raise Exception(f"yt-dlp returned error code {error_code}")
             
             mp3_path = os.path.join(DOWNLOAD_DIR, f"{file_id}.mp3")
             
+            # Verification check
             if os.path.exists(mp3_path):
-                log(f"Upload starting for {title}...")
+                file_size = os.path.getsize(mp3_path)
+                if file_size == 0:
+                    raise Exception("Downloaded file is 0 bytes. YouTube may be blocking the request.")
                 
-                # FIX: Define storage path correctly
-                # Using a timestamp to prevent browser caching issues
+                log(f"Upload starting for {title} ({file_size} bytes)...")
+                
+                # Storage path with cache-busting timestamp
                 storage_path = f"{user_id}/{song_id}/{int(time.time())}.mp3"
                 
                 # 3. Upload file to Supabase Storage
@@ -99,8 +115,7 @@ def process_queued_song(song):
                 # 4. Get the Public URL
                 public_url = supabase.storage.from_("public_audio").get_public_url(storage_path)
                 
-                # 5. Update DB: Save URL to BOTH audio_url and preview_url
-                # This ensures the gig reader sees the song as "Ready"
+                # 5. Update DB
                 supabase.table("repertoire").update({
                     "audio_url": public_url,
                     "preview_url": public_url,
@@ -110,11 +125,11 @@ def process_queued_song(song):
                 
                 log(f"SUCCESS: Finished {title}")
                 
-                # Cleanup local file to save Render disk space
+                # Cleanup
                 if os.path.exists(mp3_path):
                     os.remove(mp3_path)
             else:
-                raise Exception("FFmpeg failed to produce MP3 file")
+                raise Exception("FFmpeg failed to produce MP3 file - check if ffmpeg is installed via apt.txt")
             
         except Exception as e:
             error_msg = str(e)
@@ -123,11 +138,16 @@ def process_queued_song(song):
             try:
                 supabase.table("repertoire").update({
                     "extraction_status": "failed",
-                    "extraction_error": error_msg[:255]
+                    "extraction_error": error_msg[:250] # Truncate for DB column limits
                 }).eq("id", song_id).execute()
             except Exception as db_err:
                 log(f"Supabase update failed: {db_err}")
         finally:
+            # Cleanup any stray files (m4a, webm) in case conversion failed
+            for f in os.listdir(DOWNLOAD_DIR):
+                if file_id in f:
+                    try: os.remove(os.path.join(DOWNLOAD_DIR, f))
+                    except: pass
             gc.collect()
 
 def job_poller():
@@ -135,7 +155,6 @@ def job_poller():
     log("Job Poller initialization complete. Scanning for work...")
     while True:
         try:
-            # log("Heartbeat: Checking for jobs...")
             res = supabase.table("repertoire")\
                 .select("id, youtube_url, user_id, title")\
                 .eq("extraction_status", "queued")\
