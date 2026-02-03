@@ -42,8 +42,14 @@ def process_queued_song(song):
     user_id = song.get('user_id')
     title = song.get('title', 'Unknown Title')
 
-    # Priority: Use local cookies file if it exists to bypass 429 errors
-    cookie_path = './cookies.txt' if os.path.exists('./cookies.txt') else None
+    # Path logic: Look for cookies.txt in the root directory
+    cookie_path = os.path.join(os.getcwd(), 'cookies.txt')
+    has_cookies = os.path.exists(cookie_path)
+    
+    if has_cookies:
+        log(f"Using cookies.txt bypass for {title}")
+    else:
+        log(f"WARNING: No cookies.txt found at {cookie_path}. Using server IP (High risk of 429).")
 
     with download_semaphore:
         try:
@@ -55,7 +61,7 @@ def process_queued_song(song):
             file_id = str(uuid.uuid4())
             output_template = os.path.join(DOWNLOAD_DIR, f"{file_id}.%(ext)s")
             
-            # REFINED OPTIONS FOR 2024/2025 YOUTUBE BOT PROTECTION
+            # MODERN BYPASS OPTIONS (FEB 2026 READY)
             ydl_opts = {
                 'format': 'bestaudio/best', 
                 'noplaylist': True,
@@ -65,28 +71,30 @@ def process_queued_song(song):
                     'preferredcodec': 'mp3',
                     'preferredquality': '128',
                 }],
-                'cookiefile': cookie_path,
-                # CRITICAL: Force the iOS client to bypass PO Token requirements
+                'cookiefile': cookie_path if has_cookies else None,
                 'extractor_args': {
                     'youtube': {
-                        'player_client': ['ios'],
+                        # We try Android first, then fall back to Web. 
+                        # 'ios' is currently being heavily throttled.
+                        'player_client': ['android', 'web', 'mweb'],
+                        'skip': ['hls', 'dash'],
                     }
                 },
-                # Use a common Mobile User-Agent
-                'user_agent': 'Mozilla/5.0 (iPhone; CPU iPhone OS 17_4 like Mac OS X) AppleWebKit/605.1.15 (KHTML, like Gecko) Version/17.4 Mobile/15E148 Safari/604.1',
+                # Standard desktop User-Agent often works better when paired with cookies
+                'user_agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36',
                 'nocheckcertificate': True,
                 'quiet': False,
                 'no_warnings': False,
+                'retries': 3,
+                'fragment_retries': 5,
             }
 
             # 2. Download from YouTube
-            log(f"Downloading from YouTube (iOS Client): {video_url}")
+            log(f"Downloading from YouTube: {video_url}")
             with yt_dlp.YoutubeDL(ydl_opts) as ydl:
-                error_code = ydl.download([video_url])
-                if error_code != 0:
-                    raise Exception(f"yt-dlp returned error code {error_code}")
-            
-            mp3_path = os.path.join(DOWNLOAD_DIR, f"{file_id}.mp3")
+                result = ydl.extract_info(video_url, download=True)
+                # Ensure we got a file
+                mp3_path = os.path.join(DOWNLOAD_DIR, f"{file_id}.mp3")
             
             # Verification check
             if os.path.exists(mp3_path):
@@ -128,6 +136,7 @@ def process_queued_song(song):
             log(f"FAILED: {title} | Error: {error_msg}")
             
             try:
+                # Update status to failed so user sees why
                 supabase.table("repertoire").update({
                     "extraction_status": "failed",
                     "extraction_error": error_msg[:250]
@@ -148,6 +157,7 @@ def job_poller():
     log("Job Poller initialization complete. Scanning for work...")
     while True:
         try:
+            # Look for jobs marked as 'queued'
             res = supabase.table("repertoire")\
                 .select("id, youtube_url, user_id, title")\
                 .eq("extraction_status", "queued")\
@@ -158,6 +168,7 @@ def job_poller():
                 log(f"Job found! Processing: {res.data[0].get('title')}")
                 process_queued_song(res.data[0])
             else:
+                # Idle wait
                 time.sleep(20)
                 
         except Exception as e:
