@@ -42,10 +42,7 @@ def process_queued_song(song):
     user_id = song.get('user_id')
     title = song.get('title', 'Unknown Title')
 
-    # Auth Credentials for YouTube Bot Protection
-    po_token = os.environ.get("YOUTUBE_PO_TOKEN")
-    visitor_data = os.environ.get("YOUTUBE_VISITOR_DATA")
-    # Priority: Use environment variable or local file
+    # Priority: Use local cookies file if it exists to bypass 429 errors
     cookie_path = './cookies.txt' if os.path.exists('./cookies.txt') else None
 
     with download_semaphore:
@@ -58,7 +55,7 @@ def process_queued_song(song):
             file_id = str(uuid.uuid4())
             output_template = os.path.join(DOWNLOAD_DIR, f"{file_id}.%(ext)s")
             
-            # Refined options to prevent "Empty File" errors
+            # REFINED OPTIONS FOR 2024/2025 YOUTUBE BOT PROTECTION
             ydl_opts = {
                 'format': 'bestaudio/best', 
                 'noplaylist': True,
@@ -69,23 +66,21 @@ def process_queued_song(song):
                     'preferredquality': '128',
                 }],
                 'cookiefile': cookie_path,
-                # New standard User-Agent to prevent bot flagging
-                'user_agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36',
-                # Updated Token handling
-                'params': {
-                    'po_token': [po_token] if po_token else None,
+                # CRITICAL: Force the iOS client to bypass PO Token requirements
+                'extractor_args': {
+                    'youtube': {
+                        'player_client': ['ios'],
+                    }
                 },
-                'headers': {
-                    'X-Goog-Visitor-Id': visitor_data
-                } if visitor_data else {},
+                # Use a common Mobile User-Agent
+                'user_agent': 'Mozilla/5.0 (iPhone; CPU iPhone OS 17_4 like Mac OS X) AppleWebKit/605.1.15 (KHTML, like Gecko) Version/17.4 Mobile/15E148 Safari/604.1',
                 'nocheckcertificate': True,
-                'quiet': False, # Disabled quiet mode to debug "Empty File" in Render logs
+                'quiet': False,
                 'no_warnings': False,
-                'extract_flat': False,
             }
 
             # 2. Download from YouTube
-            log(f"Downloading from YouTube: {video_url}")
+            log(f"Downloading from YouTube (iOS Client): {video_url}")
             with yt_dlp.YoutubeDL(ydl_opts) as ydl:
                 error_code = ydl.download([video_url])
                 if error_code != 0:
@@ -101,7 +96,7 @@ def process_queued_song(song):
                 
                 log(f"Upload starting for {title} ({file_size} bytes)...")
                 
-                # Storage path with cache-busting timestamp
+                # Storage path
                 storage_path = f"{user_id}/{song_id}/{int(time.time())}.mp3"
                 
                 # 3. Upload file to Supabase Storage
@@ -125,11 +120,8 @@ def process_queued_song(song):
                 
                 log(f"SUCCESS: Finished {title}")
                 
-                # Cleanup
-                if os.path.exists(mp3_path):
-                    os.remove(mp3_path)
             else:
-                raise Exception("FFmpeg failed to produce MP3 file - check if ffmpeg is installed via apt.txt")
+                raise Exception("FFmpeg failed to produce MP3 file.")
             
         except Exception as e:
             error_msg = str(e)
@@ -138,16 +130,17 @@ def process_queued_song(song):
             try:
                 supabase.table("repertoire").update({
                     "extraction_status": "failed",
-                    "extraction_error": error_msg[:250] # Truncate for DB column limits
+                    "extraction_error": error_msg[:250]
                 }).eq("id", song_id).execute()
             except Exception as db_err:
                 log(f"Supabase update failed: {db_err}")
         finally:
-            # Cleanup any stray files (m4a, webm) in case conversion failed
-            for f in os.listdir(DOWNLOAD_DIR):
-                if file_id in f:
-                    try: os.remove(os.path.join(DOWNLOAD_DIR, f))
-                    except: pass
+            # Cleanup
+            if 'file_id' in locals():
+                for f in os.listdir(DOWNLOAD_DIR):
+                    if file_id in f:
+                        try: os.remove(os.path.join(DOWNLOAD_DIR, f))
+                        except: pass
             gc.collect()
 
 def job_poller():
