@@ -49,7 +49,7 @@ def process_queued_song(song):
     if has_cookies:
         log(f"Using cookies.txt bypass for {title}")
     else:
-        log(f"WARNING: No cookies.txt found at {cookie_path}. Using server IP (High risk of 429).")
+        log(f"WARNING: No cookies.txt found at {cookie_path}. High risk of 403/429 errors.")
 
     with download_semaphore:
         try:
@@ -74,33 +74,38 @@ def process_queued_song(song):
                 'cookiefile': cookie_path if has_cookies else None,
                 'extractor_args': {
                     'youtube': {
-                        # We try Android first, then fall back to Web. 
-                        # 'ios' is currently being heavily throttled.
-                        'player_client': ['android', 'web', 'mweb'],
+                        # 'web_safari' is currently the most resilient client
+                        # Removed 'android' as it ignores cookies and causes 403s
+                        'player_client': ['web_safari', 'web', 'mweb'],
                         'skip': ['hls', 'dash'],
                     }
                 },
-                # Standard desktop User-Agent often works better when paired with cookies
-                'user_agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36',
+                # Tells yt-dlp to use the Node/Deno runtimes we installed in Docker
+                'allow_unplayable_formats': True,
+                'external_downloader_args': ['--remote-components', 'ejs:github'],
+                
+                # High-quality User Agent to match cookies
+                'user_agent': 'Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/605.1.15 (KHTML, like Gecko) Version/17.0 Safari/605.1.15',
                 'nocheckcertificate': True,
                 'quiet': False,
                 'no_warnings': False,
-                'retries': 3,
-                'fragment_retries': 5,
+                'retries': 5,
+                'fragment_retries': 10,
             }
 
             # 2. Download from YouTube
             log(f"Downloading from YouTube: {video_url}")
             with yt_dlp.YoutubeDL(ydl_opts) as ydl:
-                result = ydl.extract_info(video_url, download=True)
-                # Ensure we got a file
+                ydl.download([video_url])
+                
+                # Path to the processed MP3
                 mp3_path = os.path.join(DOWNLOAD_DIR, f"{file_id}.mp3")
             
             # Verification check
             if os.path.exists(mp3_path):
                 file_size = os.path.getsize(mp3_path)
                 if file_size == 0:
-                    raise Exception("Downloaded file is 0 bytes. YouTube may be blocking the request.")
+                    raise Exception("Downloaded file is 0 bytes. Signature solving likely failed.")
                 
                 log(f"Upload starting for {title} ({file_size} bytes)...")
                 
@@ -129,7 +134,7 @@ def process_queued_song(song):
                 log(f"SUCCESS: Finished {title}")
                 
             else:
-                raise Exception("FFmpeg failed to produce MP3 file.")
+                raise Exception("FFmpeg/yt-dlp failed to produce MP3 file.")
             
         except Exception as e:
             error_msg = str(e)
@@ -144,12 +149,14 @@ def process_queued_song(song):
             except Exception as db_err:
                 log(f"Supabase update failed: {db_err}")
         finally:
-            # Cleanup
+            # Cleanup all temporary files matching this file_id
             if 'file_id' in locals():
                 for f in os.listdir(DOWNLOAD_DIR):
                     if file_id in f:
-                        try: os.remove(os.path.join(DOWNLOAD_DIR, f))
-                        except: pass
+                        try:
+                            os.remove(os.path.join(DOWNLOAD_DIR, f))
+                        except:
+                            pass
             gc.collect()
 
 def job_poller():
