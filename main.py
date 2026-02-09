@@ -18,7 +18,7 @@ CORS(app)
 # --- Configuration ---
 SUPABASE_URL = os.environ.get("SUPABASE_URL")
 SUPABASE_KEY = os.environ.get("SUPABASE_SERVICE_ROLE_KEY")
-PO_TOKEN = os.environ.get("YOUTUBE_PO_TOKEN")  # from Render env var
+PO_TOKEN = os.environ.get("YOUTUBE_PO_TOKEN")
 
 if not SUPABASE_URL or not SUPABASE_KEY:
     print("[CRITICAL] Missing Supabase Environment Variables!", flush=True)
@@ -53,7 +53,7 @@ def process_queued_song(song):
             file_id = str(uuid.uuid4())
             output_template = os.path.join(DOWNLOAD_DIR, f"{file_id}.%(ext)s")
 
-            # ── Modern 2026 yt-dlp options ────────────────────────────────────────
+            # ── Modern yt-dlp options (2026 compatible) ─────────────────────────────
             ydl_opts = {
                 'format': 'bestaudio/best',
                 'noplaylist': True,
@@ -65,21 +65,21 @@ def process_queued_song(song):
                 }],
                 'cookiefile': cookie_path if has_cookies else None,
 
-                # Explicitly prefer Deno (recommended runtime)
-                'js_runtimes': 'deno',
+                # Correct format for js_runtimes (dictionary required)
+                'js_runtimes': {
+                    'deno': {}           # empty dict = default Deno configuration
+                },
 
-                # Use bundled EJS if available, fallback to github
+                # Prefer bundled EJS solver, fallback to github
                 'remote_components': ['ejs:npm', 'ejs:github'],
 
-                # PO Token – only add if you actually have a valid one
                 'extractor_args': {
                     'youtube': {
                         'player_client': ['web', 'web_safari', 'android', 'ios'],
                     }
                 },
 
-                # Add PO token only if it exists (prevents invalid token errors)
-                # Format: web+TOKEN  or  web.gvs+TOKEN  etc.
+                # PO Token handling
                 'po_token': f'web+{PO_TOKEN}' if PO_TOKEN and PO_TOKEN.strip() else None,
 
                 'user_agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/122.0.0.0 Safari/537.36',
@@ -91,9 +91,9 @@ def process_queued_song(song):
                 'fragment_retries': 10,
             }
 
-            # If you have a valid PO token, you can also add it more precisely:
+            # More precise PO token injection if available
             if PO_TOKEN and PO_TOKEN.strip():
-                ydl_opts['extractor_args']['youtube']['po_token'] = [f'web+{PO_TOKEN}']
+                ydl_opts.setdefault('extractor_args', {}).setdefault('youtube', {})['po_token'] = [f'web+{PO_TOKEN}']
 
             log(f"Downloading from YouTube: {video_url}")
 
@@ -137,7 +137,7 @@ def process_queued_song(song):
             }).eq("id", song_id).execute()
 
         finally:
-            # Cleanup
+            # Cleanup downloaded files
             if 'file_id' in locals():
                 for f in os.listdir(DOWNLOAD_DIR):
                     if file_id in f:
@@ -161,14 +161,14 @@ def job_poller():
             if res.data and len(res.data) > 0:
                 process_queued_song(res.data[0])
             else:
-                time.sleep(15)   # slightly faster polling
+                time.sleep(15)
 
         except Exception as e:
             log(f"Poller Loop Exception: {e}")
             time.sleep(30)
 
 
-# Start background worker
+# Start background worker thread
 worker_thread = threading.Thread(target=job_poller, daemon=True)
 worker_thread.start()
 
@@ -178,7 +178,8 @@ def status():
     return jsonify({
         "status": "online",
         "worker_active": worker_thread.is_alive(),
-        "deno_available": "deno" in yt_dlp.utils.which("deno")
+        # Removed broken yt_dlp.utils.which check - Deno is installed via Dockerfile
+        "deno_status": "installed via Dockerfile"
     }), 200
 
 
