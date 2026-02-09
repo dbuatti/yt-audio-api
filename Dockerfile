@@ -1,27 +1,30 @@
 FROM python:3.12-slim
 
-# Install system dependencies + Deno in one layer
+# Install system dependencies + unzip (required by Deno installer)
 RUN apt-get update && apt-get install -y --no-install-recommends \
     ffmpeg \
     curl \
     ca-certificates \
+    unzip \
     && curl -fsSL https://deno.land/install.sh | sh \
     && ln -s /root/.deno/bin/deno /usr/local/bin/deno \
     && deno --version \
-    && apt-get clean && rm -rf /var/lib/apt/lists/*
+    && apt-get clean \
+    && rm -rf /var/lib/apt/lists/*
 
 WORKDIR /app
 
-# Copy and install dependencies first (caching layer)
+# Copy requirements first to leverage Docker caching
 COPY requirements.txt .
 RUN pip install --no-cache-dir -r requirements.txt
 
-# Copy application code
+# Copy the rest of the application
 COPY . .
 
-# Create download folder with correct permissions
+# Create folder for temporary storage
 RUN mkdir -p /tmp/downloads && chmod 777 /tmp/downloads
 
+# Set environment variables
 ENV PORT=10000
 ENV PYTHONUNBUFFERED=1
 
