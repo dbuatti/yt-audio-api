@@ -1,5 +1,6 @@
 flask
 flask-cors
-yt-dlp>=2025.01.26
+yt-dlp>=2026.02.01          # get a recent version
+yt-dlp-ejs>=0.4.0           # ← this is the most important addition right now
 supabase
 gunicorn
