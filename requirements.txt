@@ -1,6 +1,6 @@
-flask
-flask-cors
-yt-dlp>=2026.02.01          # get a recent version
-yt-dlp-ejs>=0.4.0           # ← this is the most important addition right now
-supabase
-gunicorn
+Flask==3.0.2
+Flask-Cors==4.0.0
+supabase==2.3.7
+yt-dlp>=2026.02.21
+yt-dlp-ejs>=0.8.0
+gunicorn==25.3.0
