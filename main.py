@@ -188,7 +188,7 @@ def job_poller():
             res = supabase.table("repertoire")\
                 .select("id, youtube_url, user_id, title, artist")\
                 .eq("extraction_status", "queued")\
-                .order('created_at', ascending=True)\
+                .order('created_at', desc=False)\
                 .limit(1)\
                 .execute()
             
