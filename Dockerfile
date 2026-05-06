@@ -16,7 +16,10 @@ WORKDIR /app
 
 # Copy requirements first to leverage Docker caching
 COPY requirements.txt .
-RUN pip install --no-cache-dir -r requirements.txt
+
+# Force the installation of specific versions to resolve the httpx/proxy conflict
+RUN pip install --no-cache-dir --upgrade pip && \
+    pip install --no-cache-dir -r requirements.txt --force-reinstall
 
 # Copy the rest of the application
 COPY . .
