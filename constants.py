@@ -1,12 +1,3 @@
-"""
-constants.py
-
-Central configuration module for YouTube Audio Converter API.
-Defines paths, token settings, and HTTP response codes.
-
-Crafted with precision by Alperen Sümeroğlu — powering clean and configurable logic.
-"""
-
 import os
 from pathlib import Path
 
