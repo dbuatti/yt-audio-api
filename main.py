@@ -4,97 +4,107 @@ import time
 import uuid
 import sys
 import gc
-import random
-import httpx
-from flask import Flask, jsonify
+import requests
+from flask import Flask, request, send_file, jsonify, make_response
 from flask_cors import CORS
 import yt_dlp
+from supabase import create_client, Client
+import boto3
 
-# Granular imports to bypass the create_client constructor
-from supabase import Client
-from postgrest import SyncPostgrestClient
-from gotrue import SyncGoTrueClient
-from storage3 import SyncStorageClient
-
-# --- Startup Log ---
-print("[SYSTEM] >>> 2026 PRODUCTION WORKER INITIALIZING <<<", flush=True)
+# Log a message when the script starts
+print("[WORKER STARTUP] Python worker script is initializing with R2 support...")
+sys.stdout.flush()
 
 app = Flask(__name__)
 CORS(app)
 
-# --- Configuration ---
+# Supabase Config
 SUPABASE_URL = os.environ.get("SUPABASE_URL")
 SUPABASE_KEY = os.environ.get("SUPABASE_SERVICE_ROLE_KEY")
-PO_TOKEN = os.environ.get("YOUTUBE_PO_TOKEN")
-DATA_SYNC_ID = os.environ.get("YOUTUBE_DATA_SYNC_ID")
 
 if not SUPABASE_URL or not SUPABASE_KEY:
-    print("[CRITICAL] Missing Supabase Environment Variables!", flush=True)
+    print("[CRITICAL] Missing Supabase environment variables!")
     sys.exit(1)
 
-# --- FIX: Manual Client Assembly ---
-# This avoids the standard __init__ logic that triggers the 'proxy' error
-class SupabaseWorkerClient(Client):
-    def __init__(self, url, key):
-        self.supabase_url = url
-        self.supabase_key = key
-        
-        # Define headers used across all services
-        base_headers = {
-            "apiKey": key, 
-            "Authorization": f"Bearer {key}",
-            "Content-Type": "application/json"
-        }
-        
-        # 1. Create a clean httpx client (No 'proxy' argument used here)
-        self.http_client = httpx.Client(headers=base_headers)
-        
-        # 2. Build Postgrest (Rest API)
-        self.postgrest = SyncPostgrestClient(f"{url}/rest/v1", headers=base_headers)
-        self.postgrest._client = self.http_client 
-        
-        # 3. Build GoTrue (Auth)
-        self.auth = SyncGoTrueClient(url=f"{url}/auth/v1", headers=base_headers)
-        self.auth._client = self.http_client
-        
-        # 4. Build Storage
-        self.storage = SyncStorageClient(f"{url}/storage/v1", base_headers)
-        self.storage._client = self.http_client
+supabase: Client = create_client(SUPABASE_URL, SUPABASE_KEY)
 
-# Initialize the custom client
-supabase = SupabaseWorkerClient(SUPABASE_URL, SUPABASE_KEY)
+# R2 Config
+R2_ENDPOINT = os.environ.get("S3_ENDPOINT")
+R2_ACCESS_KEY = os.environ.get("S3_ACCESS_KEY_ID")
+R2_SECRET_KEY = os.environ.get("S3_SECRET_ACCESS_KEY")
+R2_BUCKET = os.environ.get("S3_BUCKET_NAME")
+R2_PUBLIC_URL = os.environ.get("R2_PUBLIC_URL")
 
-# Safety Controls
+# Initialize S3 client only if variables are present
+s3 = None
+if all([R2_ENDPOINT, R2_ACCESS_KEY, R2_SECRET_KEY]):
+    s3 = boto3.client(
+        's3',
+        endpoint_url=R2_ENDPOINT,
+        aws_access_key_id=R2_ACCESS_KEY,
+        aws_secret_access_key=R2_SECRET_KEY
+    )
+else:
+    print("[WARNING] R2 Storage environment variables are incomplete. S3 client not initialized.")
+
+# Concurrency Control
 download_semaphore = threading.BoundedSemaphore(value=1)
 DOWNLOAD_DIR = "/tmp/downloads"
+COOKIE_PATH = "/tmp/cookies.txt"
 os.makedirs(DOWNLOAD_DIR, exist_ok=True)
 
 def log(message):
-    timestamp = time.strftime("%H:%M:%S")
-    print(f"[{timestamp}] [WORKER] {message}", flush=True)
+    print(f"[AUDIO-WORKER] {message}", flush=True)
+
+def sanitize_filename(name):
+    """Creates a URL-safe, human-readable filename."""
+    if not name:
+        return "track"
+    return "".join([c if c.isalnum() else "_" for c in name]).lower().strip("_")
+
+def download_cookies_from_supabase():
+    """Fetches the latest cookies.txt from Supabase Storage to handle auth blocks."""
+    try:
+        log("Checking Supabase 'cookies' bucket for fresh auth file...")
+        res = supabase.storage.from_("cookies").download("cookies.txt")
+        if res:
+            with open(COOKIE_PATH, "wb") as f:
+                f.write(res)
+            log("SUCCESS: cookies.txt synchronized from Cloud Vault.")
+            return True
+    except Exception as e:
+        log(f"Vault Sync Note: No cookies.txt found or accessible ({e}). Proceeding with PO_TOKEN only.")
+    return False
 
 def process_queued_song(song):
     song_id = song.get('id')
     video_url = song.get('youtube_url')
     user_id = song.get('user_id')
     title = song.get('title', 'Unknown Title')
+    artist = song.get('artist', 'Unknown Artist')
 
-    cookie_path = os.path.join(os.path.dirname(os.path.abspath(__file__)), 'cookies.txt')
-    has_cookies = os.path.exists(cookie_path)
-    
+    if not s3:
+        log(f"ABORT: S3 client not initialized. Cannot process {title}")
+        return
+
+    po_token = os.environ.get("YOUTUBE_PO_TOKEN")
+    visitor_data = os.environ.get("YOUTUBE_VISITOR_DATA")
+
     with download_semaphore:
         try:
-            wait_time = random.uniform(4, 8)
-            log(f"Cooldown: {wait_time:.2f}s | Title: {title}")
-            time.sleep(wait_time)
+            log(f">>> STARTING R2 PROCESSING: {title} (ID: {song_id})")
+            download_cookies_from_supabase()
 
-            supabase.table("repertoire").update({"extraction_status": "processing"}).eq("id", song_id).execute()
+            supabase.table("repertoire").update({
+                "extraction_status": "processing", 
+                "last_sync_log": "Starting high-fidelity audio extraction for R2..."
+            }).eq("id", song_id).execute()
 
             file_id = str(uuid.uuid4())
             output_template = os.path.join(DOWNLOAD_DIR, f"{file_id}.%(ext)s")
             
             ydl_opts = {
-                'format': 'bestaudio/best', 
+                'format': 'bestaudio/best',
                 'noplaylist': True,
                 'outtmpl': output_template,
                 'postprocessors': [{
@@ -102,88 +112,101 @@ def process_queued_song(song):
                     'preferredcodec': 'mp3',
                     'preferredquality': '128',
                 }],
-                'cookiefile': cookie_path if has_cookies else None,
-                'js_runtimes': {'deno': {}},
-                'extractor_args': {
-                    'youtube': {
-                        'player_client': ['web_safari', 'ios', 'android'],
-                        'skip': ['hls', 'dash'],
-                        'data_sync_id': DATA_SYNC_ID if DATA_SYNC_ID else None
-                    }
-                },
-                'po_token': f'web+{PO_TOKEN}' if PO_TOKEN else None,
-                'user_agent': 'Mozilla/5.0 (iPhone; CPU iPhone OS 17_4 like Mac OS X) AppleWebKit/605.1.15 (KHTML, like Gecko) Version/17.4 Mobile/15E148 Safari/604.1',
+                'cookiefile': COOKIE_PATH if os.path.exists(COOKIE_PATH) else None,
+                'po_token': f"web+none:{po_token}" if po_token else None,
+                'headers': {
+                    'X-Goog-Visitor-Id': visitor_data,
+                    'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36'
+                } if visitor_data else {},
                 'nocheckcertificate': True,
-                'retries': 5,
+                'quiet': True,
+                'no_warnings': False,
             }
 
-            log(f"Starting download for {video_url}")
+            log(f"Downloading audio for '{title}' from {video_url}...")
             with yt_dlp.YoutubeDL(ydl_opts) as ydl:
                 ydl.download([video_url])
-                
+            
             mp3_path = os.path.join(DOWNLOAD_DIR, f"{file_id}.mp3")
             
             if os.path.exists(mp3_path):
-                storage_path = f"{user_id}/{song_id}/{int(time.time())}.mp3"
+                log(f"Download successful. Starting upload to Cloudflare R2 for {title}.")
+                
+                # Construct descriptive filename and folder
+                clean_artist = sanitize_filename(artist)
+                clean_title = sanitize_filename(title)
+                file_name = f"{clean_artist}_{clean_title}_audio.mp3"
+                descriptive_folder = f"{song_id}_{clean_artist}_{clean_title}"
+                storage_path = f"{user_id}/{descriptive_folder}/{file_name}"
+                
                 with open(mp3_path, 'rb') as f:
-                    supabase.storage.from_("public_audio").upload(
-                        path=storage_path, 
-                        file=f,
-                        file_options={"content-type": "audio/mpeg", "x-upsert": "true"}
+                    s3.put_object(
+                        Bucket=R2_BUCKET,
+                        Key=storage_path,
+                        Body=f.read(),
+                        ContentType='audio/mpeg'
                     )
                 
-                public_url = supabase.storage.from_("public_audio").get_public_url(storage_path)
+                # Construct the public URL using the R2 Public Development URL
+                public_url = f"{R2_PUBLIC_URL.rstrip('/')}/{storage_path}"
+                
+                log(f"Upload complete. Updating Supabase record for '{title}'")
                 supabase.table("repertoire").update({
                     "audio_url": public_url,
                     "preview_url": public_url,
                     "extraction_status": "completed",
-                    "extraction_error": None
+                    "extraction_error": None,
+                    "last_extracted_at": time.strftime('%Y-%m-%dT%H:%M:%SZ', time.gmtime()),
+                    "last_sync_log": "Master audio linked successfully to R2."
                 }).eq("id", song_id).execute()
                 
-                log(f"SUCCESS: {title}")
+                log(f"SUCCESS: Finished processing '{title}'")
+                os.remove(mp3_path)
             else:
-                raise Exception("Conversion to MP3 failed.")
+                raise Exception("Post-processing failed: MP3 conversion yielded no output.")
             
         except Exception as e:
             error_msg = str(e)
-            log(f"FAILED: {error_msg}")
-            supabase.table("repertoire").update({
-                "extraction_status": "failed",
-                "extraction_error": error_msg[:250]
-            }).eq("id", song_id).execute()
-
+            log(f"FAILED: '{title}' | Error: {error_msg}")
+            try:
+                supabase.table("repertoire").update({
+                    "extraction_status": "failed",
+                    "extraction_error": error_msg[:250],
+                    "last_sync_log": f"R2 Worker Error: {error_msg[:100]}"
+                }).eq("id", song_id).execute()
+            except Exception as db_e:
+                log(f"Status update failed: {db_e}")
         finally:
-            if 'file_id' in locals():
-                for f in os.listdir(DOWNLOAD_DIR):
-                    if file_id in f:
-                        try: os.remove(os.path.join(DOWNLOAD_DIR, f))
-                        except: pass
             gc.collect()
 
 def job_poller():
+    log("Job Poller initialized for R2. Starting initial cookie sync.")
+    download_cookies_from_supabase()
+    
     while True:
         try:
             res = supabase.table("repertoire")\
-                .select("id, youtube_url, user_id, title")\
+                .select("id, youtube_url, user_id, title, artist")\
                 .eq("extraction_status", "queued")\
+                .order('created_at', ascending=True)\
                 .limit(1)\
                 .execute()
             
             if res.data and len(res.data) > 0:
-                process_queued_song(res.data[0])
+                song_data = res.data[0]
+                log(f"Found queued job: {song_data.get('title')}. Starting processing.")
+                process_queued_song(song_data)
             else:
-                time.sleep(15)
+                time.sleep(20)
         except Exception as e:
             log(f"Poller Error: {e}")
             time.sleep(30)
 
-worker_thread = threading.Thread(target=job_poller, daemon=True)
-worker_thread.start()
+threading.Thread(target=job_poller, daemon=True).start()
 
 @app.route('/')
-def status():
-    return jsonify({"status": "active", "deno": "ready", "sync_id": bool(DATA_SYNC_ID)}), 200
+def health():
+    return "R2 Worker is alive and polling Supabase...", 200
 
 if __name__ == "__main__":
-    port = int(os.environ.get("PORT", 10000))
-    app.run(host='0.0.0.0', port=port)
+    app.run(host='0.0.0.0', port=int(os.environ.get("PORT", 10000)))
