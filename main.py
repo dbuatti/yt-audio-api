@@ -27,15 +27,17 @@ if not SUPABASE_URL or not SUPABASE_KEY:
     print("[CRITICAL] Missing Supabase Environment Variables!", flush=True)
     sys.exit(1)
 
-# --- FIX: Manual HTTP Client Injection ---
-# Initialize with standard params to create the object structure
+# --- FIX: Direct internal session injection ---
+# Initialize the client normally
 supabase: Client = create_client(SUPABASE_URL, SUPABASE_KEY)
 
-# Manually override the internal clients with a clean httpx instance
-# This bypasses the buggy internal constructor that tries to pass 'proxy'
-http_client = httpx.Client()
-supabase.postgrest.set_http_client(http_client)
-supabase.auth._init_http_client(http_client)
+# Create a clean httpx client to bypass the 'proxy' argument bug
+custom_client = httpx.Client()
+
+# Manually patch the internal sessions to use our new client
+# This targets the underlying httpx clients directly
+supabase.postgrest._client = custom_client
+supabase.auth._client = custom_client
 
 # Safety Controls
 download_semaphore = threading.BoundedSemaphore(value=1)
