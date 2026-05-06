@@ -10,7 +10,7 @@ from flask import Flask, jsonify
 from flask_cors import CORS
 import yt_dlp
 
-# Manual imports for the granular construction
+# Granular imports to bypass the create_client constructor
 from supabase import Client
 from postgrest import SyncPostgrestClient
 from gotrue import SyncGoTrueClient
@@ -32,27 +32,36 @@ if not SUPABASE_URL or not SUPABASE_KEY:
     print("[CRITICAL] Missing Supabase Environment Variables!", flush=True)
     sys.exit(1)
 
-# --- FIX: Granular Client Construction ---
-# This bypasses create_client() and avoids the 'proxy' argument bug entirely.
+# --- FIX: Manual Client Assembly ---
+# This avoids the standard __init__ logic that triggers the 'proxy' error
 class SupabaseWorkerClient(Client):
     def __init__(self, url, key):
         self.supabase_url = url
         self.supabase_key = key
         
-        # Create a clean, shared HTTP client
-        self.http_client = httpx.Client(headers={"apiKey": key, "Authorization": f"Bearer {key}"})
+        # Define headers used across all services
+        base_headers = {
+            "apiKey": key, 
+            "Authorization": f"Bearer {key}",
+            "Content-Type": "application/json"
+        }
         
-        # Manually attach components
-        self.postgrest = SyncPostgrestClient(f"{url}/rest/v1", headers=self.http_client.headers)
-        self.postgrest._client = self.http_client # Inject clean client
+        # 1. Create a clean httpx client (No 'proxy' argument used here)
+        self.http_client = httpx.Client(headers=base_headers)
         
-        self.auth = SyncGoTrueClient(url=f"{url}/auth/v1", headers=self.http_client.headers)
-        self.auth._client = self.http_client # Inject clean client
+        # 2. Build Postgrest (Rest API)
+        self.postgrest = SyncPostgrestClient(f"{url}/rest/v1", headers=base_headers)
+        self.postgrest._client = self.http_client 
         
-        self.storage = SyncStorageClient(f"{url}/storage/v1", self.http_client.headers)
-        self.storage._client = self.http_client # Inject clean client
+        # 3. Build GoTrue (Auth)
+        self.auth = SyncGoTrueClient(url=f"{url}/auth/v1", headers=base_headers)
+        self.auth._client = self.http_client
+        
+        # 4. Build Storage
+        self.storage = SyncStorageClient(f"{url}/storage/v1", base_headers)
+        self.storage._client = self.http_client
 
-# Instantiate our custom client
+# Initialize the custom client
 supabase = SupabaseWorkerClient(SUPABASE_URL, SUPABASE_KEY)
 
 # Safety Controls
