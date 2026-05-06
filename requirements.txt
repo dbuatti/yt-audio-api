@@ -8,3 +8,5 @@ httpx==0.25.2
 yt-dlp>=2026.02.21
 yt-dlp-ejs>=0.8.0
 gunicorn==25.3.0
+boto3==1.34.0
+requests==2.31.0
