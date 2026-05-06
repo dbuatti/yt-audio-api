@@ -9,7 +9,12 @@ import httpx
 from flask import Flask, jsonify
 from flask_cors import CORS
 import yt_dlp
-from supabase import create_client, Client
+
+# Manual imports for the granular construction
+from supabase import Client
+from postgrest import SyncPostgrestClient
+from gotrue import SyncGoTrueClient
+from storage3 import SyncStorageClient
 
 # --- Startup Log ---
 print("[SYSTEM] >>> 2026 PRODUCTION WORKER INITIALIZING <<<", flush=True)
@@ -27,17 +32,28 @@ if not SUPABASE_URL or not SUPABASE_KEY:
     print("[CRITICAL] Missing Supabase Environment Variables!", flush=True)
     sys.exit(1)
 
-# --- FIX: Direct internal session injection ---
-# Initialize the client normally
-supabase: Client = create_client(SUPABASE_URL, SUPABASE_KEY)
+# --- FIX: Granular Client Construction ---
+# This bypasses create_client() and avoids the 'proxy' argument bug entirely.
+class SupabaseWorkerClient(Client):
+    def __init__(self, url, key):
+        self.supabase_url = url
+        self.supabase_key = key
+        
+        # Create a clean, shared HTTP client
+        self.http_client = httpx.Client(headers={"apiKey": key, "Authorization": f"Bearer {key}"})
+        
+        # Manually attach components
+        self.postgrest = SyncPostgrestClient(f"{url}/rest/v1", headers=self.http_client.headers)
+        self.postgrest._client = self.http_client # Inject clean client
+        
+        self.auth = SyncGoTrueClient(url=f"{url}/auth/v1", headers=self.http_client.headers)
+        self.auth._client = self.http_client # Inject clean client
+        
+        self.storage = SyncStorageClient(f"{url}/storage/v1", self.http_client.headers)
+        self.storage._client = self.http_client # Inject clean client
 
-# Create a clean httpx client to bypass the 'proxy' argument bug
-custom_client = httpx.Client()
-
-# Manually patch the internal sessions to use our new client
-# This targets the underlying httpx clients directly
-supabase.postgrest._client = custom_client
-supabase.auth._client = custom_client
+# Instantiate our custom client
+supabase = SupabaseWorkerClient(SUPABASE_URL, SUPABASE_KEY)
 
 # Safety Controls
 download_semaphore = threading.BoundedSemaphore(value=1)
