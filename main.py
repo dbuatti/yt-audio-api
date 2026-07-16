@@ -89,6 +89,8 @@ def process_queued_song(song):
 
     po_token = os.environ.get("YOUTUBE_PO_TOKEN")
     visitor_data = os.environ.get("YOUTUBE_VISITOR_DATA")
+    data_sync_id = os.environ.get("YOUTUBE_DATA_SYNC_ID")
+
 
     with download_semaphore:
         try:
@@ -114,6 +116,7 @@ def process_queued_song(song):
                 }],
                 'cookiefile': COOKIE_PATH if os.path.exists(COOKIE_PATH) else None,
                 'po_token': f"web+none:{po_token}" if po_token else None,
+                'extractor_args': {'youtube': {'data_sync_id': [data_sync_id]}} if data_sync_id else {},
                 'headers': {
                     'X-Goog-Visitor-Id': visitor_data,
                     'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36'
