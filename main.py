@@ -126,8 +126,26 @@ def process_queued_song(song):
             }
 
             log(f"Downloading audio for '{title}' from {video_url}...")
-            with yt_dlp.YoutubeDL(ydl_opts) as ydl:
-                ydl.download([video_url])
+            try:
+                with yt_dlp.YoutubeDL(ydl_opts) as ydl:
+                    ydl.download([video_url])
+            except Exception as download_error:
+                error_str = str(download_error).lower()
+                # If it likely failed due to bad cookies or auth issues, try one last time WITHOUT cookies
+                if any(phrase in error_str for phrase in ["cookies", "unavailable", "403", "sign in"]):
+                    log(f"Primary attempt failed, retrying WITHOUT cookies for '{title}'...")
+                    ydl_opts_no_cookies = ydl_opts.copy()
+                    ydl_opts_no_cookies['cookiefile'] = None
+                    # Also clear po_token if we think it's the culprit? Maybe keep it for now.
+                    try:
+                        with yt_dlp.YoutubeDL(ydl_opts_no_cookies) as ydl_retry:
+                            ydl_retry.download([video_url])
+                        log(f"Retry WITHOUT cookies SUCCEEDED for '{title}'!")
+                    except Exception as retry_error:
+                        log(f"Retry without cookies failed for '{title}': {retry_error}")
+                        raise download_error # Raise original error to trigger the friendly error mapping
+                else:
+                    raise download_error
             
             mp3_path = os.path.join(DOWNLOAD_DIR, f"{file_id}.mp3")
             
@@ -167,12 +185,24 @@ def process_queued_song(song):
             
         except Exception as e:
             error_msg = str(e)
+            
+            # Map technical errors to user-friendly messages
+            friendly_error = error_msg
+            if "cookies are no longer valid" in error_msg:
+                friendly_error = "YouTube cookies expired. Please upload a new cookies.txt to the 'cookies' bucket in Supabase."
+            elif "Video unavailable" in error_msg:
+                friendly_error = "Video unavailable. This may be due to region restrictions, age-rating, or YouTube blocking the worker IP. Try updating cookies.txt."
+            elif "Sign in to confirm your age" in error_msg:
+                friendly_error = "Age-restricted video. Valid cookies.txt required to download."
+            elif "Incomplete YouTube PO Token" in error_msg or "po_token" in error_msg.lower():
+                friendly_error = "YouTube PO Token issue. The worker's environment variables may need updating."
+
             log(f"FAILED: '{title}' | Error: {error_msg}")
             try:
                 supabase.table("repertoire").update({
                     "extraction_status": "failed",
-                    "extraction_error": error_msg[:250],
-                    "last_sync_log": f"R2 Worker Error: {error_msg[:100]}"
+                    "extraction_error": friendly_error[:250],
+                    "last_sync_log": f"R2 Worker Error: {friendly_error[:100]}"
                 }).eq("id", song_id).execute()
             except Exception as db_e:
                 log(f"Status update failed: {db_e}")
