@@ -115,14 +115,23 @@ def process_queued_song(song):
                 }],
                 'cookiefile': COOKIE_PATH if os.path.exists(COOKIE_PATH) else None,
                 'po_token': f"web+none:{po_token}" if po_token else None,
-                'extractor_args': {'youtube': {'data_sync_id': [data_sync_id]}} if data_sync_id else {},
+                'extractor_args': {'youtube': {
+                    'data_sync_id': [data_sync_id],
+                    'player_client': ['web', 'mweb', 'tv']
+                }} if data_sync_id else {'youtube': {'player_client': ['web', 'mweb', 'tv']}},
                 'headers': {
                     'X-Goog-Visitor-Id': visitor_data,
-                    'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36'
-                } if visitor_data else {},
+                    'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/121.0.0.0 Safari/537.36',
+                    'Accept-Language': 'en-US,en;q=0.9',
+                } if visitor_data else {
+                    'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/121.0.0.0 Safari/537.36',
+                },
                 'nocheckcertificate': True,
                 'quiet': True,
                 'no_warnings': False,
+                'source_address': '0.0.0.0', # help with ipv6 issues
+                'retries': 3,
+                'fragment_retries': 5,
             }
 
             log(f"Downloading audio for '{title}' from {video_url}...")
@@ -186,28 +195,37 @@ def process_queued_song(song):
         except Exception as e:
             error_msg = str(e)
             
-            # Map technical errors to user-friendly messages
-            friendly_error = error_msg
-            if "cookies are no longer valid" in error_msg:
-                friendly_error = "YouTube cookies expired. Please upload a new cookies.txt to the 'cookies' bucket in Supabase."
-            elif "Video unavailable" in error_msg:
-                friendly_error = "Video unavailable. This may be due to region restrictions, age-rating, or YouTube blocking the worker IP. Try updating cookies.txt."
-            elif "Sign in to confirm your age" in error_msg:
-                friendly_error = "Age-restricted video. Valid cookies.txt required to download."
-            elif "Incomplete YouTube PO Token" in error_msg or "po_token" in error_msg.lower():
-                friendly_error = "YouTube PO Token issue. The worker's environment variables may need updating."
+                # Map technical errors to user-friendly messages
+                friendly_error = error_msg
+                if "cookies are no longer valid" in error_msg:
+                    friendly_error = "YouTube cookies expired. Please upload a new cookies.txt to the 'cookies' bucket in Supabase."
+                elif "Video unavailable" in error_msg:
+                    friendly_error = "Video unavailable. This may be due to region restrictions, age-rating, or YouTube blocking the worker IP. Try updating cookies.txt."
+                elif "Sign in to confirm your age" in error_msg:
+                    friendly_error = "Age-restricted video. Valid cookies.txt required to download."
+                elif "Incomplete YouTube PO Token" in error_msg or "po_token" in error_msg.lower():
+                    friendly_error = "YouTube PO Token issue. The worker's environment variables may need updating."
+                elif "403: Forbidden" in error_msg:
+                    friendly_error = "YouTube Access Denied (403). The server IP might be temporarily throttled."
 
-            log(f"FAILED: '{title}' | Error: {error_msg}")
-            try:
-                supabase.table("repertoire").update({
-                    "extraction_status": "failed",
-                    "extraction_error": friendly_error[:250],
-                    "last_sync_log": f"R2 Worker Error: {friendly_error[:100]}"
-                }).eq("id", song_id).execute()
-            except Exception as db_e:
-                log(f"Status update failed: {db_e}")
-        finally:
-            gc.collect()
+                log(f"FAILED: '{title}' | Error: {error_msg}")
+                try:
+                    supabase.table("repertoire").update({
+                        "extraction_status": "failed",
+                        "extraction_error": friendly_error[:250],
+                        "last_sync_log": f"R2 Worker Error: {friendly_error[:100]}"
+                    }).eq("id", song_id).execute()
+                except Exception as db_e:
+                    log(f"Status update failed: {db_e}")
+            finally:
+                # Cleanup leftover files in case of crash/partial download
+                for f in os.listdir(DOWNLOAD_DIR):
+                    if f.startswith(file_id):
+                        try:
+                            os.remove(os.path.join(DOWNLOAD_DIR, f))
+                        except:
+                            pass
+                gc.collect()
 
 def job_poller():
     log("Job Poller initialized for R2. Starting initial cookie sync.")
