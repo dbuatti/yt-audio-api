@@ -120,10 +120,10 @@ def process_queued_song(song):
                 'po_token': f"web+none:{po_token}" if po_token else None,
                 'extractor_args': {'youtube': {
                     'data_sync_id': [data_sync_id],
-                    'player_client': ['mweb', 'web', 'tv'],
+                    'player_client': ['web_safari', 'tv', 'web'],
                     'player_skip': ['webpage'] # Try to skip webpage download if possible
                 }} if data_sync_id else {'youtube': {
-                    'player_client': ['mweb', 'web', 'tv'],
+                    'player_client': ['web_safari', 'tv', 'web'],
                     'player_skip': ['webpage']
                 }},
                 'headers': {
