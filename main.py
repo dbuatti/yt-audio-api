@@ -11,6 +11,8 @@ import yt_dlp
 from supabase import create_client, Client
 import boto3
 
+import random
+
 # Log a message when the script starts
 print("[WORKER STARTUP] Python worker script is initializing with R2 support...")
 sys.stdout.flush()
@@ -70,7 +72,8 @@ def download_cookies_from_supabase():
         if res:
             with open(COOKIE_PATH, "wb") as f:
                 f.write(res)
-            log("SUCCESS: cookies.txt synchronized from Cloud Vault.")
+            file_size = os.path.getsize(COOKIE_PATH)
+            log(f"SUCCESS: cookies.txt synchronized ({file_size} bytes).")
             return True
     except Exception as e:
         log(f"Vault Sync Note: No cookies.txt found or accessible ({e}). Proceeding with PO_TOKEN only.")
@@ -117,21 +120,29 @@ def process_queued_song(song):
                 'po_token': f"web+none:{po_token}" if po_token else None,
                 'extractor_args': {'youtube': {
                     'data_sync_id': [data_sync_id],
-                    'player_client': ['web', 'mweb', 'tv']
-                }} if data_sync_id else {'youtube': {'player_client': ['web', 'mweb', 'tv']}},
+                    'player_client': ['android', 'web', 'mweb', 'tv'],
+                    'player_skip': ['webpage'] # Try to skip webpage download if possible
+                }} if data_sync_id else {'youtube': {
+                    'player_client': ['android', 'web', 'mweb', 'tv'],
+                    'player_skip': ['webpage']
+                }},
                 'headers': {
                     'X-Goog-Visitor-Id': visitor_data,
                     'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/121.0.0.0 Safari/537.36',
                     'Accept-Language': 'en-US,en;q=0.9',
+                    'Referer': 'https://www.google.com/',
                 } if visitor_data else {
                     'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/121.0.0.0 Safari/537.36',
+                    'Referer': 'https://www.google.com/',
                 },
                 'nocheckcertificate': True,
+                'geo_bypass': True,
                 'quiet': True,
                 'no_warnings': False,
-                'source_address': '0.0.0.0', # help with ipv6 issues
-                'retries': 3,
-                'fragment_retries': 5,
+                'source_address': '0.0.0.0',
+                'retries': 5,
+                'fragment_retries': 10,
+                'socket_timeout': 30,
             }
 
             log(f"Downloading audio for '{title}' from {video_url}...")
