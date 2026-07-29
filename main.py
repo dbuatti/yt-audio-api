@@ -146,25 +146,43 @@ def process_queued_song(song):
             }
 
             log(f"Downloading audio for '{title}' from {video_url}...")
-            try:
-                with yt_dlp.YoutubeDL(ydl_opts) as ydl:
-                    ydl.download([video_url])
-            except Exception as download_error:
-                error_str = str(download_error).lower()
-                # If it likely failed due to bad cookies or auth issues, try one last time WITHOUT cookies
-                if any(phrase in error_str for phrase in ["cookies", "unavailable", "403", "sign in"]):
-                    log(f"Primary attempt failed, retrying WITHOUT cookies for '{title}'...")
-                    ydl_opts_no_cookies = ydl_opts.copy()
-                    ydl_opts_no_cookies['cookiefile'] = None
-                    try:
-                        with yt_dlp.YoutubeDL(ydl_opts_no_cookies) as ydl_retry:
-                            ydl_retry.download([video_url])
-                        log(f"Retry WITHOUT cookies SUCCEEDED for '{title}'!")
-                    except Exception as retry_error:
-                        log(f"Retry without cookies failed for '{title}': {retry_error}")
-                        raise download_error 
-                else:
-                    raise download_error
+
+            strategies = [
+                ("tv with cookies", ydl_opts),
+                ("web_embedded no auth", lambda: {
+                    **ydl_opts,
+                    'extractor_args': {'youtube': {
+                        'player_client': ['web_embedded'],
+                        'player_skip': ['webpage']
+                    }},
+                    'cookiefile': None,
+                }),
+                ("tv no cookies", lambda: {
+                    **ydl_opts,
+                    'cookiefile': None,
+                }),
+            ]
+
+            last_error = None
+            for attempt_name, attempt_opts in strategies:
+                try:
+                    if callable(attempt_opts):
+                        opts = attempt_opts()
+                    else:
+                        opts = attempt_opts
+                    with yt_dlp.YoutubeDL(opts) as ydl:
+                        ydl.download([video_url])
+                    last_error = None
+                    if attempt_name != "tv with cookies":
+                        log(f"SUCCEEDED with '{attempt_name}' for '{title}'!")
+                    break
+                except Exception as e:
+                    last_error = e
+                    log(f"'{attempt_name}' failed for '{title}', trying next strategy...")
+                    time.sleep(10)
+
+            if last_error:
+                raise last_error
             
             mp3_path = os.path.join(DOWNLOAD_DIR, f"{file_id}.mp3")
             
