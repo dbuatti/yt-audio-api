@@ -13,14 +13,12 @@ import boto3
 
 import random
 
-# Log a message when the script starts
 print("[WORKER STARTUP] Python worker script is initializing with R2 support...")
 sys.stdout.flush()
 
 app = Flask(__name__)
 CORS(app)
 
-# Supabase Config
 SUPABASE_URL = os.environ.get("SUPABASE_URL")
 SUPABASE_KEY = os.environ.get("SUPABASE_SERVICE_ROLE_KEY")
 
@@ -30,42 +28,38 @@ if not SUPABASE_URL or not SUPABASE_KEY:
 
 supabase: Client = create_client(SUPABASE_URL, SUPABASE_KEY)
 
-# R2 Config
 R2_ENDPOINT = os.environ.get("S3_ENDPOINT")
 R2_ACCESS_KEY = os.environ.get("S3_ACCESS_KEY_ID")
 R2_SECRET_KEY = os.environ.get("S3_SECRET_ACCESS_KEY")
 R2_BUCKET = os.environ.get("S3_BUCKET_NAME")
 R2_PUBLIC_URL = os.environ.get("R2_PUBLIC_URL")
 
-# Initialize S3 client only if variables are present
-s3 = None
-if all([R2_ENDPOINT, R2_ACCESS_KEY, R2_SECRET_KEY]):
-    s3 = boto3.client(
-        's3',
-        endpoint_url=R2_ENDPOINT,
-        aws_access_key_id=R2_ACCESS_KEY,
-        aws_secret_access_key=R2_SECRET_KEY
-    )
-else:
-    print("[WARNING] R2 Storage environment variables are incomplete. S3 client not initialized.")
+if not all([R2_ENDPOINT, R2_ACCESS_KEY, R2_SECRET_KEY, R2_BUCKET, R2_PUBLIC_URL]):
+    print("[CRITICAL] Missing R2/S3 environment variables!")
+    sys.exit(1)
 
-# Concurrency Control
+s3 = boto3.client(
+    's3',
+    endpoint_url=R2_ENDPOINT,
+    aws_access_key_id=R2_ACCESS_KEY,
+    aws_secret_access_key=R2_SECRET_KEY
+)
+
 download_semaphore = threading.BoundedSemaphore(value=1)
 DOWNLOAD_DIR = "/tmp/downloads"
 COOKIE_PATH = "/tmp/cookies.txt"
+BGUTIL_SERVER_HOME = os.environ.get("BGUTIL_SERVER_HOME", "/root/bgutil-ytdlp-pot-provider/server")
 os.makedirs(DOWNLOAD_DIR, exist_ok=True)
 
 def log(message):
     print(f"[AUDIO-WORKER] {message}", flush=True)
 
 def sanitize_filename(name):
-    """Creates a URL-safe, human-readable filename."""
     if not name:
         return "track"
     return "".join([c if c.isalnum() else "_" for c in name]).lower().strip("_")
 
 def download_cookies_from_supabase():
-    """Fetches the latest cookies.txt from Supabase Storage to handle auth blocks."""
     try:
         log("Checking Supabase 'cookies' bucket for fresh auth file...")
         res = supabase.storage.from_("cookies").download("cookies.txt")
@@ -77,7 +71,16 @@ def download_cookies_from_supabase():
             return True
     except Exception as e:
         log(f"Vault Sync Note: No cookies.txt found or accessible ({e}). Proceeding with PO_TOKEN only.")
+    # Remove stale file so yt-dlp doesn't use rotten cookies
+    try:
+        if os.path.exists(COOKIE_PATH):
+            os.remove(COOKIE_PATH)
+    except Exception:
+        pass
     return False
+
+def _cookie_file_if_valid():
+    return COOKIE_PATH if os.path.exists(COOKIE_PATH) else None
 
 def process_queued_song(song):
     song_id = song.get('id')
@@ -86,12 +89,11 @@ def process_queued_song(song):
     title = song.get('title', 'Unknown Title')
     artist = song.get('artist', 'Unknown Artist')
 
-    if not s3:
-        log(f"ABORT: S3 client not initialized. Cannot process {title}")
+    if not user_id:
+        log(f"ABORT: missing user_id for '{title}'")
+        _mark_failed(song_id, "Missing user_id")
         return
 
-    po_token = os.environ.get("YOUTUBE_PO_TOKEN")
-    visitor_data = os.environ.get("YOUTUBE_VISITOR_DATA")
     data_sync_id = os.environ.get("YOUTUBE_DATA_SYNC_ID")
 
     with download_semaphore:
@@ -101,67 +103,56 @@ def process_queued_song(song):
             download_cookies_from_supabase()
 
             supabase.table("repertoire").update({
-                "extraction_status": "processing", 
+                "extraction_status": "processing",
                 "last_sync_log": "Starting high-fidelity audio extraction for R2..."
             }).eq("id", song_id).execute()
 
             output_template = os.path.join(DOWNLOAD_DIR, f"{file_id}.%(ext)s")
-            
-            ydl_opts = {
-                'format': 'bestaudio/best',
-                'noplaylist': True,
-                'outtmpl': output_template,
-                'postprocessors': [{
-                    'key': 'FFmpegExtractAudio',
-                    'preferredcodec': 'mp3',
-                    'preferredquality': '128',
-                }],
-                'cookiefile': COOKIE_PATH if os.path.exists(COOKIE_PATH) else None,
-                'po_token': f"web+none:{po_token}" if po_token else None,
-                'extractor_args': {'youtube': {
-                    'data_sync_id': [data_sync_id],
-                    'player_client': ['tv', 'web'],
-                    'player_skip': ['webpage']
-                }} if data_sync_id else {'youtube': {
-                    'player_client': ['tv', 'web'],
-                    'player_skip': ['webpage']
-                }},
-                'headers': {
-                    'X-Goog-Visitor-Id': visitor_data,
-                    'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/121.0.0.0 Safari/537.36',
-                    'Accept-Language': 'en-US,en;q=0.9',
-                    'Referer': 'https://www.google.com/',
-                } if visitor_data else {
-                    'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/121.0.0.0 Safari/537.36',
-                    'Referer': 'https://www.google.com/',
-                },
-                'nocheckcertificate': True,
-                'geo_bypass': True,
-                'quiet': True,
-                'no_warnings': False,
-                'source_address': '0.0.0.0',
-                'retries': 5,
-                'fragment_retries': 10,
-                'socket_timeout': 30,
-            }
 
-            log(f"Downloading audio for '{title}' from {video_url}...")
+            def base_opts(cookiefile):
+                yt = {
+                    'player_client': ['web', 'mweb'],
+                }
+                if data_sync_id:
+                    yt['data_sync_id'] = [data_sync_id]
+                return {
+                    'format': 'bestaudio/best',
+                    'noplaylist': True,
+                    'outtmpl': output_template,
+                    'postprocessors': [{
+                        'key': 'FFmpegExtractAudio',
+                        'preferredcodec': 'mp3',
+                        'preferredquality': '128',
+                    }],
+                    'cookiefile': cookiefile,
+                    'extractor_args': {
+                        'youtube': yt,
+                        'youtubepot-bgutilscript': {
+                            'server_home': BGUTIL_SERVER_HOME,
+                        },
+                    },
+                    'http_headers': {
+                        'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/121.0.0.0 Safari/537.36',
+                        'Accept-Language': 'en-US,en;q=0.9',
+                        'Referer': 'https://www.google.com/',
+                    },
+                    'nocheckcertificate': True,
+                    'geo_bypass': True,
+                    'quiet': True,
+                    'no_warnings': False,
+                    'retries': 5,
+                    'fragment_retries': 10,
+                    'socket_timeout': 30,
+                }
 
-            strategies = [
-                ("tv with cookies", ydl_opts),
-                ("web_embedded no auth", lambda: {
-                    **ydl_opts,
-                    'extractor_args': {'youtube': {
-                        'player_client': ['web_embedded'],
-                        'player_skip': ['webpage']
-                    }},
-                    'cookiefile': None,
-                }),
-                ("tv no cookies", lambda: {
-                    **ydl_opts,
-                    'cookiefile': None,
-                }),
-            ]
+            strategies = []
+            cf = _cookie_file_if_valid()
+            if cf:
+                strategies.append(("web with cookies", base_opts(cf)))
+            strategies.append(("web no cookies", base_opts(None)))
+            strategies.append(("mweb no auth", lambda o=base_opts(None): {**o, 'extractor_args': {**o['extractor_args'], 'youtube': {**o['extractor_args']['youtube'], 'player_client': ['mweb']}}}))
+            strategies.append(("tv no cookies", lambda o=base_opts(None): {**o, 'extractor_args': {**o['extractor_args'], 'youtube': {**o['extractor_args']['youtube'], 'player_client': ['tv'], 'player_skip': ['webpage']}}}))
+            strategies.append(("web_embedded no auth", lambda o=base_opts(None): {**o, 'extractor_args': {**o['extractor_args'], 'youtube': {**o['extractor_args']['youtube'], 'player_client': ['web_embedded'], 'player_skip': ['webpage']}}}))
 
             last_error = None
             for attempt_name, attempt_opts in strategies:
@@ -170,31 +161,40 @@ def process_queued_song(song):
                         opts = attempt_opts()
                     else:
                         opts = attempt_opts
+                    log(f"Trying strategy '{attempt_name}' for '{title}'...")
                     with yt_dlp.YoutubeDL(opts) as ydl:
                         ydl.download([video_url])
                     last_error = None
-                    if attempt_name != "tv with cookies":
+                    if attempt_name not in ("web with cookies", "web no cookies"):
                         log(f"SUCCEEDED with '{attempt_name}' for '{title}'!")
                     break
                 except Exception as e:
                     last_error = e
-                    log(f"'{attempt_name}' failed for '{title}', trying next strategy...")
-                    time.sleep(10)
+                    err = str(e)
+                    log(f"'{attempt_name}' failed for '{title}': {err[:200]}")
+                    # If cookies are rotten, drop them and skip remaining cookie variants
+                    if "cookies are no longer valid" in err or "cookies are no longer" in err:
+                        try:
+                            if os.path.exists(COOKIE_PATH):
+                                os.remove(COOKIE_PATH)
+                        except Exception:
+                            pass
+                    time.sleep(3)
 
             if last_error:
                 raise last_error
-            
+
             mp3_path = os.path.join(DOWNLOAD_DIR, f"{file_id}.mp3")
-            
+
             if os.path.exists(mp3_path):
                 log(f"Download successful. Starting upload to Cloudflare R2 for {title}.")
-                
+
                 clean_artist = sanitize_filename(artist)
                 clean_title = sanitize_filename(title)
                 file_name = f"{clean_artist}_{clean_title}_audio.mp3"
                 descriptive_folder = f"{song_id}_{clean_artist}_{clean_title}"
                 storage_path = f"{user_id}/{descriptive_folder}/{file_name}"
-                
+
                 with open(mp3_path, 'rb') as f:
                     s3.put_object(
                         Bucket=R2_BUCKET,
@@ -202,9 +202,9 @@ def process_queued_song(song):
                         Body=f.read(),
                         ContentType='audio/mpeg'
                     )
-                
+
                 public_url = f"{R2_PUBLIC_URL.rstrip('/')}/{storage_path}"
-                
+
                 log(f"Upload complete. Updating Supabase record for '{title}'")
                 supabase.table("repertoire").update({
                     "audio_url": public_url,
@@ -214,16 +214,15 @@ def process_queued_song(song):
                     "last_extracted_at": time.strftime('%Y-%m-%dT%H:%M:%SZ', time.gmtime()),
                     "last_sync_log": "Master audio linked successfully to R2."
                 }).eq("id", song_id).execute()
-                
+
                 log(f"SUCCESS: Finished processing '{title}'")
                 os.remove(mp3_path)
             else:
                 raise Exception("Post-processing failed: MP3 conversion yielded no output.")
-            
+
         except Exception as e:
             error_msg = str(e)
-            
-            # Map technical errors to user-friendly messages
+
             friendly_error = error_msg
             if "cookies are no longer valid" in error_msg:
                 friendly_error = "YouTube cookies expired. Please upload a new cookies.txt to the 'cookies' bucket in Supabase."
@@ -235,32 +234,36 @@ def process_queued_song(song):
                 friendly_error = "YouTube PO Token issue. The worker's environment variables may need updating."
             elif "403: Forbidden" in error_msg:
                 friendly_error = "YouTube Access Denied (403). The server IP might be temporarily throttled."
+            elif "Sign in to confirm you" in error_msg:
+                friendly_error = "YouTube bot detection. Refresh cookies.txt and ensure bgutil PO provider is working."
 
             log(f"FAILED: '{title}' | Error: {error_msg}")
-            try:
-                supabase.table("repertoire").update({
-                    "extraction_status": "failed",
-                    "extraction_error": friendly_error[:250],
-                    "last_sync_log": f"R2 Worker Error: {friendly_error[:100]}"
-                }).eq("id", song_id).execute()
-            except Exception as db_e:
-                log(f"Status update failed: {db_e}")
+            _mark_failed(song_id, friendly_error)
         finally:
-            # Cleanup leftover files in case of crash/partial download
             for f in os.listdir(DOWNLOAD_DIR):
                 if f.startswith(file_id):
                     try:
                         os.remove(os.path.join(DOWNLOAD_DIR, f))
-                    except:
+                    except Exception:
                         pass
             gc.collect()
+
+def _mark_failed(song_id, friendly_error):
+    try:
+        supabase.table("repertoire").update({
+            "extraction_status": "failed",
+            "extraction_error": (friendly_error or "")[:250],
+            "last_sync_log": f"R2 Worker Error: {(friendly_error or '')[:100]}"
+        }).eq("id", song_id).execute()
+    except Exception as db_e:
+        log(f"Status update failed: {db_e}")
 
 def job_poller():
     log("Job Poller initialized for R2. Starting initial cookie sync.")
     download_cookies_from_supabase()
-    
+
     consecutive_failures = {}
-    
+
     while True:
         try:
             res = supabase.table("repertoire")\
@@ -269,37 +272,30 @@ def job_poller():
                 .order('created_at', desc=False)\
                 .limit(1)\
                 .execute()
-            
+
             if res.data and len(res.data) > 0:
                 song_data = res.data[0]
                 song_id = song_data.get('id')
                 title = song_data.get('title', 'Unknown')
-                
+
                 process_queued_song(song_data)
-                
+
                 time.sleep(5)
-                
+
                 after_status = supabase.table("repertoire")\
                     .select("extraction_status")\
                     .eq("id", song_id)\
                     .execute()
-                
+
                 after_val = after_status.data[0].get('extraction_status') if after_status.data else None
-                
+
                 if after_val == 'queued':
                     consecutive_failures[song_id] = consecutive_failures.get(song_id, 0) + 1
                     log(f"Song '{title}' still queued after attempt {consecutive_failures[song_id]}.")
-                    
+
                     if consecutive_failures[song_id] >= 3:
                         log(f"Auto-failing '{title}' after {consecutive_failures[song_id]} failed attempts.")
-                        try:
-                            supabase.table("repertoire").update({
-                                "extraction_status": "failed",
-                                "extraction_error": "Auto-failed: exceeded retry limit",
-                                "last_sync_log": "Worker auto-failed after 3 consecutive failed attempts."
-                            }).eq("id", song_id).execute()
-                        except Exception as e:
-                            log(f"Failed to update status to failed: {e}")
+                        _mark_failed(song_id, "Auto-failed: exceeded retry limit")
                         consecutive_failures[song_id] = 0
                 else:
                     consecutive_failures.pop(song_id, None)
@@ -311,9 +307,27 @@ def job_poller():
 
 threading.Thread(target=job_poller, daemon=True).start()
 
+# Optional keep-alive self-ping to mitigate Render free-tier spin-down.
+def _keep_alive():
+    url = os.environ.get("RENDER_EXTERNAL_URL")
+    if not url:
+        return
+    while True:
+        try:
+            requests.get(url.rstrip("/") + "/", timeout=10)
+        except Exception:
+            pass
+        time.sleep(600)
+
+threading.Thread(target=_keep_alive, daemon=True).start()
+
 @app.route('/')
 def health():
     return "R2 Worker is alive and polling Supabase...", 200
+
+@app.route('/health')
+def health2():
+    return jsonify(status="ok", time=time.time()), 200
 
 if __name__ == "__main__":
     app.run(host='0.0.0.0', port=int(os.environ.get("PORT", 10000)))
