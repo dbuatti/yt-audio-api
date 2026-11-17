@@ -111,7 +111,7 @@ def process_queued_song(song):
 
             def base_opts(cookiefile):
                 yt = {
-                    'player_client': ['web', 'mweb'],
+                    'player_client': ['web'],
                 }
                 if data_sync_id:
                     yt['data_sync_id'] = [data_sync_id]
