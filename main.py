@@ -96,8 +96,7 @@ def process_queued_song(song):
 
     data_sync_id = os.environ.get("YOUTUBE_DATA_SYNC_ID")
 
-    # PROXY_URL is currently broken (407 auth); disable until fixed
-    proxy_url = None
+    proxy_url = os.environ.get("PROXY_URL")
 
     with download_semaphore:
         file_id = str(uuid.uuid4())
