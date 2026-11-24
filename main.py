@@ -111,7 +111,7 @@ def process_queued_song(song):
 
             output_template = os.path.join(DOWNLOAD_DIR, f"{file_id}.%(ext)s")
 
-            def base_opts(cookiefile):
+            def base_opts(cookiefile, use_proxy=True):
                 yt = {
                     'player_client': ['web'],
                 }
@@ -127,7 +127,7 @@ def process_queued_song(song):
                         'preferredquality': '128',
                     }],
                     'cookiefile': cookiefile,
-                    'proxy': proxy_url if proxy_url else None,
+                    'proxy': (proxy_url if (proxy_url and use_proxy) else None),
                     'extractor_args': {
                         'youtube': yt,
                         'youtubepot-bgutilscript': {
@@ -149,6 +149,11 @@ def process_queued_song(song):
                 }
                 return opts
 
+            def is_proxy_error(err):
+                e = str(err).lower()
+                return ("proxyerror" in e or "407" in e or "tunnel connection failed" in e
+                        or "unable to connect to proxy" in e or "proxy" in e and "auth" in e)
+
             strategies = []
             cf = _cookie_file_if_valid()
             if cf:
@@ -159,12 +164,15 @@ def process_queued_song(song):
             strategies.append(("web_embedded no auth", lambda o=base_opts(None): {**o, 'extractor_args': {**o['extractor_args'], 'youtube': {**o['extractor_args']['youtube'], 'player_client': ['web_embedded'], 'player_skip': ['webpage']}}}))
 
             last_error = None
+            proxy_disabled = False
             for attempt_name, attempt_opts in strategies:
                 try:
                     if callable(attempt_opts):
                         opts = attempt_opts()
                     else:
-                        opts = attempt_opts
+                        opts = dict(attempt_opts)
+                    if proxy_disabled:
+                        opts["proxy"] = None
                     log(f"Trying strategy '{attempt_name}' for '{title}'...")
                     with yt_dlp.YoutubeDL(opts) as ydl:
                         ydl.download([video_url])
@@ -182,7 +190,24 @@ def process_queued_song(song):
                                 os.remove(COOKIE_PATH)
                         except Exception:
                             pass
-                    # Back off harder on rate limiting / IP blocks
+                    # If the proxy itself is broken, disable it for remaining attempts
+                    if proxy_url and ("proxy" in err.lower() or "407" in err or "tunnel connection failed" in err.lower() or "unable to connect to proxy" in err.lower()):
+                        if not proxy_disabled:
+                            log("Proxy is broken; disabling proxy for remaining attempts.")
+                        proxy_disabled = True
+                        # Retry this same attempt immediately without proxy
+                        try:
+                            opts2 = dict(opts)
+                            opts2["proxy"] = None
+                            log(f"Retrying '{attempt_name}' without proxy...")
+                            with yt_dlp.YoutubeDL(opts2) as ydl:
+                                ydl.download([video_url])
+                            last_error = None
+                            break
+                        except Exception as e2:
+                            last_error = e2
+                            err = str(e2)
+                            log(f"'{attempt_name}' (no proxy) failed: {err[:200]}")
                     if "429" in err or "Too Many Requests" in err or "403" in err:
                         log("Rate limit / IP block detected; backing off 30s...")
                         time.sleep(30)
