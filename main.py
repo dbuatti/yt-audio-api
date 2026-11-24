@@ -96,7 +96,8 @@ def process_queued_song(song):
 
     data_sync_id = os.environ.get("YOUTUBE_DATA_SYNC_ID")
 
-    proxy_url = os.environ.get("PROXY_URL")
+    # PROXY_URL is currently broken (407 auth); disable until fixed
+    proxy_url = None
 
     with download_semaphore:
         file_id = str(uuid.uuid4())
@@ -209,8 +210,8 @@ def process_queued_song(song):
                             err = str(e2)
                             log(f"'{attempt_name}' (no proxy) failed: {err[:200]}")
                     if "429" in err or "Too Many Requests" in err or "403" in err:
-                        log("Rate limit / IP block detected; backing off 30s...")
-                        time.sleep(30)
+                        log("Rate limit / IP block detected; backing off 10s...")
+                        time.sleep(10)
                     else:
                         time.sleep(3)
 
@@ -321,8 +322,8 @@ def job_poller():
                 after_val = after_status.data[0].get('extraction_status') if after_status.data else None
 
                 if after_val == 'failed':
-                    log("Job failed; cooling down 60s before next attempt to avoid IP throttling.")
-                    time.sleep(60)
+                    log("Job failed; cooling down 15s before next attempt.")
+                    time.sleep(15)
                 elif after_val == 'queued':
                     consecutive_failures[song_id] = consecutive_failures.get(song_id, 0) + 1
                     log(f"Song '{title}' still queued after attempt {consecutive_failures[song_id]}.")
