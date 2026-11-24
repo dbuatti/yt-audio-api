@@ -5,3 +5,4 @@ __pycache__/
 .dyad/
 cookies.txt
 .env
+logs/
