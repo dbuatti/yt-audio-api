@@ -96,6 +96,8 @@ def process_queued_song(song):
 
     data_sync_id = os.environ.get("YOUTUBE_DATA_SYNC_ID")
 
+    proxy_url = os.environ.get("PROXY_URL")
+
     with download_semaphore:
         file_id = str(uuid.uuid4())
         try:
@@ -115,7 +117,7 @@ def process_queued_song(song):
                 }
                 if data_sync_id:
                     yt['data_sync_id'] = [data_sync_id]
-                return {
+                opts = {
                     'format': 'bestaudio/best',
                     'noplaylist': True,
                     'outtmpl': output_template,
@@ -125,6 +127,7 @@ def process_queued_song(song):
                         'preferredquality': '128',
                     }],
                     'cookiefile': cookiefile,
+                    'proxy': proxy_url if proxy_url else None,
                     'extractor_args': {
                         'youtube': yt,
                         'youtubepot-bgutilscript': {
@@ -144,6 +147,7 @@ def process_queued_song(song):
                     'fragment_retries': 10,
                     'socket_timeout': 30,
                 }
+                return opts
 
             strategies = []
             cf = _cookie_file_if_valid()
@@ -172,14 +176,18 @@ def process_queued_song(song):
                     last_error = e
                     err = str(e)
                     log(f"'{attempt_name}' failed for '{title}': {err[:200]}")
-                    # If cookies are rotten, drop them and skip remaining cookie variants
                     if "cookies are no longer valid" in err or "cookies are no longer" in err:
                         try:
                             if os.path.exists(COOKIE_PATH):
                                 os.remove(COOKIE_PATH)
                         except Exception:
                             pass
-                    time.sleep(3)
+                    # Back off harder on rate limiting / IP blocks
+                    if "429" in err or "Too Many Requests" in err or "403" in err:
+                        log("Rate limit / IP block detected; backing off 30s...")
+                        time.sleep(30)
+                    else:
+                        time.sleep(3)
 
             if last_error:
                 raise last_error
@@ -280,8 +288,6 @@ def job_poller():
 
                 process_queued_song(song_data)
 
-                time.sleep(5)
-
                 after_status = supabase.table("repertoire")\
                     .select("extraction_status")\
                     .eq("id", song_id)\
@@ -289,7 +295,10 @@ def job_poller():
 
                 after_val = after_status.data[0].get('extraction_status') if after_status.data else None
 
-                if after_val == 'queued':
+                if after_val == 'failed':
+                    log("Job failed; cooling down 60s before next attempt to avoid IP throttling.")
+                    time.sleep(60)
+                elif after_val == 'queued':
                     consecutive_failures[song_id] = consecutive_failures.get(song_id, 0) + 1
                     log(f"Song '{title}' still queued after attempt {consecutive_failures[song_id]}.")
 
